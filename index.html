@@ -115,7 +115,7 @@
         }
 
         function sendMessage(senderId, payload) {
-            context.sendCustomMessage(NAMESPACE, senderId, JSON.stringify(payload));
+            context.sendCustomMessage(NAMESPACE, senderId, payload);
         }
 
         context.addCustomMessageListener(NAMESPACE, function(event) {
