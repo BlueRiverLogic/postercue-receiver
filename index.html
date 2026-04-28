@@ -157,6 +157,14 @@
             }
 
             else if (data.action === 'clear') {
+                // Detach load/error handlers BEFORE clearing src —
+                // setting src='' triggers onerror, which would fire
+                // the stale handler from the last 'show' command and
+                // send a spurious "Failed to load image" error.
+                activeImg.onload = null;
+                activeImg.onerror = null;
+                standbyImg.onload = null;
+                standbyImg.onerror = null;
                 activeImg.classList.remove('active');
                 standbyImg.classList.remove('active');
                 activeImg.src = '';
