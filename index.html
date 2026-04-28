@@ -167,12 +167,13 @@
             }
 
             else if (data.action === 'getInfo') {
+                var dpr = window.devicePixelRatio || 1;
                 sendMessage(event.senderId, {
                     event: 'info',
-                    width: window.innerWidth,
-                    height: window.innerHeight,
+                    width: Math.round(window.innerWidth * dpr),
+                    height: Math.round(window.innerHeight * dpr),
                     rotation: currentRotation,
-                    devicePixelRatio: window.devicePixelRatio || 1
+                    devicePixelRatio: dpr
                 });
             }
         });
