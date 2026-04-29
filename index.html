@@ -190,14 +190,14 @@
             console.log('PosterCue receiver ready');
         });
 
-        // Disable the Cast platform's idle timeout. By default, the receiver
+        // Extend the Cast platform's idle timeout. By default, the receiver
         // is torn down after ~5 minutes of "no active media". Since PosterCue
         // displays static images (not streaming media), the platform considers
-        // it idle immediately. Setting maxInactivity to 0 keeps the receiver
-        // alive indefinitely until the app disconnects or the user casts
-        // something else — matching digital signage / photo frame behavior.
+        // it idle immediately. Set to 86400s (24 hours) — the practical maximum.
+        // Note: maxInactivity has a minimum of 5s; setting 0 causes immediate
+        // disconnect on idle, which prevents connections entirely.
         var options = new cast.framework.CastReceiverOptions();
-        options.maxInactivity = 0;
+        options.maxInactivity = 86400;
         context.start(options);
     </script>
 </body>
