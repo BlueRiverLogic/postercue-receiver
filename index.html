@@ -190,13 +190,21 @@
             console.log('PosterCue receiver ready');
         });
 
-        // Extend the Cast platform's idle timeout. By default, the receiver
-        // is torn down after ~5 minutes of "no active media". Since PosterCue
-        // displays static images (not streaming media), the platform considers
-        // it idle immediately. Set to 86400s (24 hours) — the practical maximum.
-        // Note: maxInactivity has a minimum of 5s; setting 0 causes immediate
-        // disconnect on idle, which prevents connections entirely.
+        // PosterCue is a non-media receiver (static images, not streaming).
+        // Two timeouts must be addressed to prevent unexpected disconnects:
+        //
+        // 1. disableIdleTimeout: The Cast platform kills receivers after ~5 min
+        //    when no active media session exists. Since PosterCue never plays
+        //    media, the platform always considers it "idle." This disables that
+        //    platform-level idle kill entirely. Google's docs: "should only be
+        //    used for non-media apps" — which is exactly what PosterCue is.
+        //
+        // 2. maxInactivity: Sender↔receiver heartbeat timeout. How long the
+        //    receiver waits without hearing from the sender app before closing.
+        //    Set to 86400s (24 hours) so the session survives long periods
+        //    between image pushes. Minimum is 5s (0 breaks connections).
         var options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout = true;
         options.maxInactivity = 86400;
         context.start(options);
     </script>
