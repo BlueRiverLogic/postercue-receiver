@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=1080, height=1920, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; }
         body {
@@ -207,18 +207,53 @@
 
             else if (data.action === 'getInfo') {
                 var dpr = window.devicePixelRatio || 1;
+                // Report everything about the display pipeline so we can
+                // diagnose portrait vs landscape rendering on different TVs.
+                var screenInfo = {};
+                try {
+                    screenInfo.screenWidth = window.screen.width;
+                    screenInfo.screenHeight = window.screen.height;
+                    screenInfo.screenAvailWidth = window.screen.availWidth;
+                    screenInfo.screenAvailHeight = window.screen.availHeight;
+                    if (window.screen.orientation) {
+                        screenInfo.orientationType = window.screen.orientation.type;
+                        screenInfo.orientationAngle = window.screen.orientation.angle;
+                    }
+                    screenInfo.outerWidth = window.outerWidth;
+                    screenInfo.outerHeight = window.outerHeight;
+                    screenInfo.docWidth = document.documentElement.clientWidth;
+                    screenInfo.docHeight = document.documentElement.clientHeight;
+                } catch(e) {
+                    screenInfo.error = e.message;
+                }
                 sendMessage(event.senderId, {
                     event: 'info',
                     width: Math.round(window.innerWidth * dpr),
                     height: Math.round(window.innerHeight * dpr),
                     rotation: currentRotation,
-                    devicePixelRatio: dpr
+                    devicePixelRatio: dpr,
+                    screen: screenInfo
                 });
             }
         });
 
         context.addEventListener(cast.framework.system.EventType.READY, function() {
             console.log('PosterCue receiver ready');
+
+            // Attempt to lock screen orientation to portrait.
+            // This works on some smart TV browsers — if Tizen supports it,
+            // the Cast web view will switch to portrait rendering.
+            try {
+                if (screen.orientation && screen.orientation.lock) {
+                    screen.orientation.lock('portrait').then(function() {
+                        console.log('Screen orientation locked to portrait');
+                    }).catch(function(e) {
+                        console.log('Orientation lock failed: ' + e.message);
+                    });
+                }
+            } catch(e) {
+                console.log('Orientation API not available: ' + e.message);
+            }
         });
 
         // PosterCue is a non-media receiver (static images, not streaming).
