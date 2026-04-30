@@ -119,6 +119,7 @@
         }
 
         context.addCustomMessageListener(NAMESPACE, function(event) {
+            var receivedAt = Date.now();
             var data = event.data;
             if (typeof data === 'string') {
                 data = JSON.parse(data);
@@ -135,14 +136,18 @@
                     standbyImg = temp;
                     sendMessage(event.senderId, {
                         event: 'imageDisplayed',
-                        url: data.url
+                        url: data.url,
+                        ts: Date.now(),
+                        processingMs: Date.now() - receivedAt
                     });
                 };
                 standbyImg.onerror = function() {
                     sendMessage(event.senderId, {
                         event: 'error',
                         message: 'Failed to load image',
-                        url: data.url
+                        url: data.url,
+                        ts: Date.now(),
+                        processingMs: Date.now() - receivedAt
                     });
                 };
                 standbyImg.src = data.url;
@@ -152,7 +157,9 @@
                 applyRotation(data.rotation || 0);
                 sendMessage(event.senderId, {
                     event: 'orientationSet',
-                    rotation: currentRotation
+                    rotation: currentRotation,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
                 });
             }
 
@@ -171,7 +178,7 @@
                 standbyImg.src = '';
                 canvas.style.display = 'none';
                 splash.style.display = 'flex';
-                sendMessage(event.senderId, { event: 'cleared' });
+                sendMessage(event.senderId, { event: 'cleared', ts: Date.now(), processingMs: Date.now() - receivedAt });
             }
 
             else if (data.action === 'testRotation') {
@@ -192,7 +199,9 @@
                         applyRotation(data.originalRotation || 0);
                         sendMessage(event.senderId, {
                             event: 'testRotationComplete',
-                            tested: rotations
+                            tested: rotations,
+                            ts: Date.now(),
+                            processingMs: Date.now() - receivedAt
                         });
                         return;
                     }
@@ -232,7 +241,9 @@
                     height: Math.round(window.innerHeight * dpr),
                     rotation: currentRotation,
                     devicePixelRatio: dpr,
-                    screen: screenInfo
+                    screen: screenInfo,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
                 });
             }
         });
