@@ -87,6 +87,74 @@
         var standbyImg = document.getElementById('img2');
         var currentRotation = 0;
 
+        // ── Receiver Visibility Tracking ─────────────────────────────
+        //
+        // The receiver detects when it's hidden (Home button, HDMI input
+        // switch, TV standby) and signals the iOS sender via the custom
+        // channel. The sender uses this to decide whether to disconnect
+        // and reconnect (triggering CEC foreground launch) on the next
+        // image push, instead of pushing into a hidden receiver.
+        //
+        // Three independent detection sources:
+        //   1. Page Visibility API  — Home button, launcher overlay
+        //   2. VISIBILITY_CHANGED   — HDMI input switch, TV power
+        //   3. STANDBY_CHANGED      — TV standby enter/exit
+        //
+        // Deduplication: only sends when receiverVisible actually
+        // changes, since multiple sources may fire simultaneously
+        // (e.g. standby triggers both STANDBY_CHANGED and
+        // document.visibilitychange on some devices).
+
+        var receiverVisible = true;
+
+        function broadcastVisibility(isVisible, reason) {
+            if (isVisible === receiverVisible) return;
+            receiverVisible = isVisible;
+            var msg = {
+                event: 'visibilityChanged',
+                isVisible: isVisible,
+                reason: reason,
+                ts: Date.now()
+            };
+            var senders = context.getSenders();
+            for (var i = 0; i < senders.length; i++) {
+                context.sendCustomMessage(NAMESPACE, senders[i].id, msg);
+            }
+            console.log('PosterCue visibility: ' + (isVisible ? 'VISIBLE' : 'HIDDEN') + ' reason=' + reason);
+        }
+
+        // Source 1: Page Visibility API — detects Home button press,
+        // launcher overlay, and any other Android activity foregrounding
+        // over the Cast receiver. This is the primary signal for the
+        // "Home button hides receiver" scenario.
+        document.addEventListener('visibilitychange', function() {
+            broadcastVisibility(!document.hidden,
+                document.hidden ? 'documentHidden' : 'documentVisible');
+        });
+
+        // Source 2: Cast SDK VISIBILITY_CHANGED — fires when the HDMI
+        // input changes (user switches TV input away from Cast device)
+        // or the TV powers off. Distinct from Page Visibility API which
+        // tracks the Android app lifecycle, not the HDMI signal.
+        context.addEventListener(
+            cast.framework.system.EventType.VISIBILITY_CHANGED,
+            function(event) {
+                broadcastVisibility(event.isVisible,
+                    event.isVisible ? 'hdmiInputActive' : 'hdmiInputChanged');
+            }
+        );
+
+        // Source 3: Cast SDK STANDBY_CHANGED — fires when the TV enters
+        // or exits standby mode (screen on/off). Complements the sender-
+        // side GCKCastDeviceStatusListener standbyStatus callback.
+        context.addEventListener(
+            cast.framework.system.EventType.STANDBY_CHANGED,
+            function(event) {
+                broadcastVisibility(!event.isStandby,
+                    event.isStandby ? 'standby' : 'standbyExit');
+            }
+        );
+
         function applyRotation(deg) {
             currentRotation = deg;
             var transform = '';
@@ -212,6 +280,19 @@
                     setTimeout(nextRotation, 5000);
                 }
                 nextRotation();
+            }
+
+            else if (data.action === 'getVisibility') {
+                // On-demand visibility query — used by the sender after
+                // app restart to check if an existing receiver session
+                // is hidden behind the home screen.
+                sendMessage(event.senderId, {
+                    event: 'visibility',
+                    isVisible: receiverVisible,
+                    documentHidden: document.hidden,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
+                });
             }
 
             else if (data.action === 'getInfo') {
