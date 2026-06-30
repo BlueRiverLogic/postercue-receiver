@@ -186,6 +186,253 @@
             context.sendCustomMessage(NAMESPACE, senderId, payload);
         }
 
+        // ── CueTheShow: logging, telemetry & memory diagnostics ──────────
+        //
+        // The slideshow runs autonomously on the receiver after the iOS app
+        // closes, so the receiver is our only eyes on what's happening. These
+        // helpers give us (a) a leveled on-device log (visible via chrome://
+        // inspect) and (b) telemetry pushed back to any still-connected sender
+        // so it lands in PosterCue's Debug Logs during testing.
+
+        var LOG_LEVELS = { error: 0, info: 1, verbose: 2 };
+        var logLevel   = LOG_LEVELS.info;   // raised to verbose per-slideshow via msg.verbose
+        var logRing    = [];                // last N lines, for on-device inspection
+        var LOG_RING_MAX = 200;
+
+        function tlog(level, msg) {
+            if (LOG_LEVELS[level] > logLevel) return;
+            var line = '[' + level + '] ' + msg;
+            logRing.push(line);
+            if (logRing.length > LOG_RING_MAX) logRing.shift();
+            console.log('PosterCue ' + line);
+        }
+
+        // Chromium-only heap figures. IMPORTANT: this is the JS heap, NOT the
+        // decoded-image / GPU memory where the slideshow frames actually live —
+        // so treat it as a trend signal, not ground truth. The authoritative
+        // OOM evidence is the sender-side silence watchdog (heartbeats stop).
+        function heapStats() {
+            try {
+                var m = window.performance && window.performance.memory;
+                if (!m) return null;
+                return {
+                    used:  m.usedJSHeapSize,
+                    total: m.totalJSHeapSize,
+                    limit: m.jsHeapSizeLimit,
+                    pct:   m.jsHeapSizeLimit ? Math.round(m.usedJSHeapSize / m.jsHeapSizeLimit * 100) : null
+                };
+            } catch (e) { return null; }
+        }
+
+        // Broadcast a telemetry event to every connected sender (the triggering
+        // sender may have closed, so we don't target a single id).
+        function broadcast(event, extra) {
+            var msg = { event: event, ts: Date.now() };
+            if (extra) { for (var k in extra) { msg[k] = extra[k]; } }
+            var senders = context.getSenders();
+            for (var i = 0; i < senders.length; i++) {
+                try { context.sendCustomMessage(NAMESPACE, senders[i].id, msg); } catch (e) {}
+            }
+        }
+
+        // Best-effort crash reporting: a real OOM kills the page before it can
+        // speak, but JS-level errors fire these first — ship a 'fatal' out
+        // synchronously so the sender at least learns what happened.
+        window.addEventListener('error', function(e) {
+            tlog('error', 'window.onerror: ' + (e && e.message));
+            broadcast('fatal', { message: String(e && e.message), source: e && e.filename, line: e && e.lineno });
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            var reason = (e && e.reason) ? (e.reason.message || String(e.reason)) : 'unknown';
+            tlog('error', 'unhandledrejection: ' + reason);
+            broadcast('fatal', { message: 'unhandledrejection: ' + reason });
+        });
+
+        // ── CueTheShow slideshow engine ──────────────────────────────────
+        //
+        // Strategy (proven primitive only): preload every image into its own
+        // plain <img> layer inside #canvas — no crossOrigin, no fetch, no
+        // canvas pixel reads — which is the only ingest the Cast runtime allows
+        // over plain HTTP. Once loaded, the decoded frames live in the DOM and
+        // survive the iOS app / LocalHTTPServer going away, so the receiver can
+        // cycle them on its own timer indefinitely. The cost is memory: N
+        // decoded frames held at once — which is exactly what the heap/heartbeat
+        // telemetry above lets us watch as we ramp the image count up.
+
+        var slideshow = {
+            active: false,
+            paused: false,
+            mode: 'sequential',
+            durationMs: 30000,
+            loop: true,
+            images: [],         // [{ id, url, el, loaded }]
+            index: -1,
+            loopCount: 0,
+            timer: null,
+            heartbeat: null,
+            startedAt: 0,
+            lastShownId: null,
+            lastMemWarnAt: 0
+        };
+
+        // Tear the slideshow down and free every decoded frame.
+        function clearSlideshow(reason) {
+            if (slideshow.timer)     { clearInterval(slideshow.timer);     slideshow.timer = null; }
+            if (slideshow.heartbeat) { clearInterval(slideshow.heartbeat); slideshow.heartbeat = null; }
+            for (var i = 0; i < slideshow.images.length; i++) {
+                var el = slideshow.images[i].el;
+                if (el) {
+                    el.onload = null; el.onerror = null; el.src = '';
+                    if (el.parentNode) el.parentNode.removeChild(el);
+                }
+            }
+            var hadImages = slideshow.images.length;
+            slideshow.active = false;
+            slideshow.paused = false;
+            slideshow.images = [];
+            slideshow.index = -1;
+            slideshow.loopCount = 0;
+            slideshow.lastShownId = null;
+            if (hadImages) tlog('info', 'slideshow cleared (' + reason + '), freed ' + hadImages + ' layers');
+        }
+
+        function checkMemory() {
+            var heap = heapStats();
+            if (!heap || heap.pct === null) return;
+            if (heap.pct >= 80 && (Date.now() - slideshow.lastMemWarnAt) > 15000) {
+                slideshow.lastMemWarnAt = Date.now();
+                tlog('error', 'MEMORY WARNING heap ' + heap.pct + '%');
+                broadcast('memoryWarning', { heap: heap, usagePct: heap.pct });
+            }
+        }
+
+        function sendHeartbeat() {
+            if (!slideshow.active) return;
+            broadcast('slideshowHeartbeat', {
+                index:    slideshow.index,
+                total:    slideshow.images.length,
+                mode:     slideshow.mode,
+                loops:    slideshow.loopCount,
+                paused:   slideshow.paused,
+                uptimeMs: Date.now() - slideshow.startedAt,
+                heap:     heapStats()
+            });
+        }
+
+        // Show the next frame. Instant cut (hard swap) — no crossfade.
+        function advanceSlideshow() {
+            if (!slideshow.active || slideshow.paused) return;
+            var loaded = slideshow.images.filter(function(it) { return it.loaded && it.el; });
+            if (loaded.length === 0) return;
+
+            var next;
+            if (slideshow.mode === 'shuffle') {
+                if (loaded.length === 1) {
+                    next = loaded[0];
+                } else {
+                    do { next = loaded[Math.floor(Math.random() * loaded.length)]; }
+                    while (next.id === slideshow.lastShownId);   // avoid back-to-back repeat
+                }
+            } else {
+                var prev = slideshow.index;
+                slideshow.index = (slideshow.index + 1) % loaded.length;
+                if (slideshow.index === 0 && prev >= 0) slideshow.loopCount++;
+                next = loaded[slideshow.index];
+            }
+
+            for (var i = 0; i < slideshow.images.length; i++) {
+                if (slideshow.images[i].el) slideshow.images[i].el.classList.remove('active');
+            }
+            next.el.classList.add('active');
+            slideshow.lastShownId = next.id;
+
+            if (logLevel >= LOG_LEVELS.verbose) {
+                broadcast('slideshowAdvanced', { index: slideshow.index, id: next.id, heap: heapStats() });
+            }
+            checkMemory();
+        }
+
+        function startSlideshow(data) {
+            clearSlideshow('restart');               // tear down any prior show first
+
+            // Hide the single-image layers; the slideshow uses its own layers
+            // inside the same #canvas, so it inherits orientation/rotation.
+            activeImg.classList.remove('active');
+            standbyImg.classList.remove('active');
+            splash.style.display = 'none';
+            canvas.style.display = 'block';
+
+            logLevel            = data.verbose ? LOG_LEVELS.verbose : LOG_LEVELS.info;
+            slideshow.mode      = (data.mode === 'shuffle') ? 'shuffle' : 'sequential';
+            slideshow.durationMs = Math.max(2000, data.durationMs || 30000);
+            slideshow.loop      = data.loop !== false;
+            slideshow.startedAt = Date.now();
+            slideshow.active    = true;
+            slideshow.paused    = false;
+
+            var list  = data.images || [];
+            var total = list.length;
+            tlog('info', 'slideshow start: ' + total + ' images, mode=' + slideshow.mode +
+                         ', duration=' + slideshow.durationMs + 'ms, verbose=' + (logLevel === LOG_LEVELS.verbose));
+
+            if (total === 0) {
+                broadcast('slideshowError', { phase: 'preload', message: 'empty image list' });
+                clearSlideshow('empty');
+                return;
+            }
+
+            var loaded = 0, failed = 0, settled = 0;
+
+            function onSettled() {
+                settled++;
+                if (settled < total) return;
+                var heap = heapStats();
+                tlog('info', 'slideshow ready: ' + loaded + ' loaded, ' + failed + ' failed' +
+                             (heap ? ', heap ' + heap.pct + '%' : ''));
+                broadcast('slideshowReady', { total: total, loaded: loaded, failed: failed, heap: heap });
+                checkMemory();
+                if (loaded === 0) {
+                    broadcast('slideshowError', { phase: 'preload', message: 'no images loaded' });
+                    clearSlideshow('all-failed');
+                    return;
+                }
+                // Kick off the autonomous loop — from here the sender can close.
+                slideshow.index = -1;
+                advanceSlideshow();
+                slideshow.timer     = setInterval(advanceSlideshow, slideshow.durationMs);
+                slideshow.heartbeat = setInterval(sendHeartbeat, 30000);  // throttled health beat
+            }
+
+            for (var i = 0; i < total; i++) {
+                (function(item, idx) {
+                    var el = document.createElement('img');
+                    el.className = 'layer';
+                    el.onload = function() {
+                        item.loaded = true; loaded++;
+                        tlog('verbose', 'preloaded [' + (idx + 1) + '/' + total + '] ' + item.id);
+                        broadcast('slideshowLoading', { loaded: loaded, total: total, id: item.id });
+                        onSettled();
+                    };
+                    el.onerror = function() {
+                        item.loaded = false; failed++;
+                        tlog('error', 'preload FAILED [' + (idx + 1) + '/' + total + '] ' + item.id + ' ' + item.url);
+                        broadcast('imageLoadError', { url: item.url, index: idx, id: item.id });
+                        onSettled();
+                    };
+                    item.el = el;
+                    canvas.appendChild(el);
+                    el.src = item.url;       // plain HTTP <img> load — the proven primitive
+                })(list[i], i);
+            }
+            slideshow.images = list;
+        }
+
+        function slideshowControl(op) {
+            if (op === 'pause')  { slideshow.paused = true;  tlog('info', 'slideshow paused');  broadcast('slideshowPaused',  {}); }
+            else if (op === 'resume') { slideshow.paused = false; tlog('info', 'slideshow resumed'); broadcast('slideshowResumed', {}); }
+            else if (op === 'stop')   { clearSlideshow('stop-command'); broadcast('slideshowStopped', {}); }
+        }
+
         context.addCustomMessageListener(NAMESPACE, function(event) {
             var receivedAt = Date.now();
             var data = event.data;
@@ -194,6 +441,9 @@
             }
 
             if (data.action === 'show') {
+                // A single image (album art, movie poster, auto-push) permanently
+                // stops any running slideshow and displays the new image.
+                clearSlideshow('single-image');
                 standbyImg.onload = function() {
                     splash.style.display = 'none';
                     canvas.style.display = 'block';
@@ -232,6 +482,7 @@
             }
 
             else if (data.action === 'clear') {
+                clearSlideshow('clear-command');
                 // Detach load/error handlers BEFORE clearing src —
                 // setting src='' triggers onerror, which would fire
                 // the stale handler from the last 'show' command and
@@ -290,6 +541,48 @@
                     event: 'visibility',
                     isVisible: receiverVisible,
                     documentHidden: document.hidden,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
+                });
+            }
+
+            else if (data.action === 'slideshow') {
+                startSlideshow(data);
+                sendMessage(event.senderId, {
+                    event: 'slideshowStarted',
+                    total: (data.images || []).length,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
+                });
+            }
+
+            else if (data.action === 'slideshowControl') {
+                slideshowControl(data.op);
+            }
+
+            else if (data.action === 'replace') {
+                // Swap the image set without ending the Cast session.
+                startSlideshow(data);
+                sendMessage(event.senderId, {
+                    event: 'slideshowReplaced',
+                    total: (data.images || []).length,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
+                });
+            }
+
+            else if (data.action === 'getSlideshowStatus') {
+                sendMessage(event.senderId, {
+                    event: 'slideshowStatus',
+                    active: slideshow.active,
+                    paused: slideshow.paused,
+                    mode: slideshow.mode,
+                    index: slideshow.index,
+                    total: slideshow.images.length,
+                    loops: slideshow.loopCount,
+                    durationMs: slideshow.durationMs,
+                    uptimeMs: slideshow.active ? (Date.now() - slideshow.startedAt) : 0,
+                    heap: heapStats(),
                     ts: Date.now(),
                     processingMs: Date.now() - receivedAt
                 });
