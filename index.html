@@ -155,31 +155,48 @@
             }
         );
 
-        function applyRotation(deg) {
-            currentRotation = deg;
+        // Apply an orientation transform to a single element. Shared by the
+        // image canvas AND the idle splash so the PosterCue placeholder is
+        // upright on portrait displays — not just the photos.
+        function styleRotation(el, deg) {
             var transform = '';
             if (deg === 90) {
                 transform = 'rotate(90deg) translateY(-100%)';
-                canvas.style.transformOrigin = 'top left';
-                canvas.style.width = '100vh';
-                canvas.style.height = '100vw';
+                el.style.transformOrigin = 'top left';
+                el.style.width = '100vh';
+                el.style.height = '100vw';
             } else if (deg === 270) {
                 transform = 'rotate(270deg) translateX(-100%)';
-                canvas.style.transformOrigin = 'top left';
-                canvas.style.width = '100vh';
-                canvas.style.height = '100vw';
+                el.style.transformOrigin = 'top left';
+                el.style.width = '100vh';
+                el.style.height = '100vw';
             } else if (deg === 180) {
                 transform = 'rotate(180deg)';
-                canvas.style.transformOrigin = 'center center';
-                canvas.style.width = '100vw';
-                canvas.style.height = '100vh';
+                el.style.transformOrigin = 'center center';
+                el.style.width = '100vw';
+                el.style.height = '100vh';
             } else {
                 transform = '';
-                canvas.style.transformOrigin = 'center center';
-                canvas.style.width = '100vw';
-                canvas.style.height = '100vh';
+                el.style.transformOrigin = 'center center';
+                el.style.width = '100vw';
+                el.style.height = '100vh';
             }
-            canvas.style.transform = transform;
+            el.style.transform = transform;
+        }
+
+        function applyRotation(deg) {
+            currentRotation = deg;
+            styleRotation(canvas, deg);
+            styleRotation(splash, deg);
+        }
+
+        // Return the display to the branded idle placeholder (portrait-aware).
+        // Used when a slideshow is stopped or the display is cleared, instead of
+        // leaving the screen black.
+        function showSplash() {
+            styleRotation(splash, currentRotation);
+            splash.style.display = 'flex';
+            canvas.style.display = 'none';
         }
 
         function sendMessage(senderId, payload) {
@@ -430,7 +447,7 @@
         function slideshowControl(op) {
             if (op === 'pause')  { slideshow.paused = true;  tlog('info', 'slideshow paused');  broadcast('slideshowPaused',  {}); }
             else if (op === 'resume') { slideshow.paused = false; tlog('info', 'slideshow resumed'); broadcast('slideshowResumed', {}); }
-            else if (op === 'stop')   { clearSlideshow('stop-command'); broadcast('slideshowStopped', {}); }
+            else if (op === 'stop')   { clearSlideshow('stop-command'); showSplash(); broadcast('slideshowStopped', {}); }
         }
 
         context.addCustomMessageListener(NAMESPACE, function(event) {
@@ -495,8 +512,7 @@
                 standbyImg.classList.remove('active');
                 activeImg.src = '';
                 standbyImg.src = '';
-                canvas.style.display = 'none';
-                splash.style.display = 'flex';
+                showSplash();   // portrait-aware idle placeholder (not a black screen)
                 sendMessage(event.senderId, { event: 'cleared', ts: Date.now(), processingMs: Date.now() - receivedAt });
             }
 
