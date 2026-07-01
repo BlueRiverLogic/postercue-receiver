@@ -87,6 +87,20 @@
         var standbyImg = document.getElementById('img2');
         var currentRotation = 0;
 
+        // Restore the last orientation this device used, applied on load BEFORE
+        // first paint. The Cast viewport is always landscape, so without this the
+        // splash paints sideways on a portrait display until the app's
+        // setOrientation message arrives over the network (~hundreds of ms) — a
+        // visible flash. A portrait display that ran at 90° last time now paints
+        // the placeholder upright instantly. (applyRotation is a hoisted function
+        // declaration, so calling it here — before its textual definition — is fine.)
+        try {
+            var savedRotation = parseInt(localStorage.getItem('pc_rotation') || '0', 10);
+            if (!isNaN(savedRotation) && savedRotation !== 0) {
+                applyRotation(savedRotation);
+            }
+        } catch (e) {}
+
         // ── Receiver Visibility Tracking ─────────────────────────────
         //
         // The receiver detects when it's hidden (Home button, HDMI input
@@ -490,6 +504,9 @@
 
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
+                // Remember it for this device so the next cold start paints the
+                // placeholder in the right orientation immediately (no flash).
+                try { localStorage.setItem('pc_rotation', String(currentRotation)); } catch (e) {}
                 sendMessage(event.senderId, {
                     event: 'orientationSet',
                     rotation: currentRotation,
