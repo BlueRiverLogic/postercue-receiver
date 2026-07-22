@@ -68,6 +68,13 @@
             width: 100vw; height: 100vh;
             display: none; overflow: hidden; background: #000;
             z-index: 6;
+            /* Promote the whole rotated container to its own GPU layer. In
+               portrait (90° rotation) the container's transform is otherwise
+               re-rasterized with the whole animating subtree every frame,
+               which roughly halved fps vs landscape. As a promoted layer the
+               rotation is a one-time compositor transform. */
+            will-change: transform;
+            backface-visibility: hidden;
         }
         #motion.active { display: block; }
         #mp-fill, #mp-bg, #mp-subject {
@@ -75,8 +82,12 @@
             width: 100%; height: 100%;
             will-change: transform;   /* GPU-composite the camera/parallax transforms */
         }
-        /* Blurred, zoomed copy behind a portrait poster on a landscape TV. */
-        #mp-fill    { object-fit: cover; filter: blur(40px) brightness(0.55); transform: scale(1.25); }
+        /* Blurred, zoomed copy behind a portrait poster on a landscape TV.
+           A <canvas> painted with a tiny (≈64px) cover-cropped copy of the bg,
+           then upscaled to fill: the upscale IS the blur, so we avoid a
+           full-screen per-frame CSS blur() (the expensive part). brightness
+           is cheap and kept. */
+        #mp-fill    { transform: scale(1.25); filter: brightness(0.55); image-rendering: auto; }
         #mp-bg      { object-fit: contain; }
         #mp-subject { object-fit: contain; }
         #mp-particles { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -114,7 +125,7 @@
          Back-to-front: blurred fill, background poster, subject cutout,
          particle canvas, light sweep, colour grade, vignette. -->
     <div id="motion">
-        <img    id="mp-fill">
+        <canvas id="mp-fill"></canvas>
         <img    id="mp-bg">
         <img    id="mp-subject">
         <canvas id="mp-particles"></canvas>
@@ -565,6 +576,24 @@
 
         function rand(a, b) { return a + Math.random() * (b - a); }
 
+        // Paint the blurred-fill layer: draw the bg cover-cropped into a tiny
+        // (64×36) canvas backing, which CSS then upscales to fill the screen.
+        // The heavy bilinear upscale reads as a soft blur for free — far
+        // cheaper than a full-screen per-frame CSS blur(40px). Drawing a
+        // cross-origin <img> taints the canvas, but we only ever DISPLAY it
+        // (never read pixels), which is allowed. Static: painted once per push.
+        function paintFill(img) {
+            var W = 64, H = 36;   // 16:9 backing; the container is 1920×1080 pre-rotation
+            var iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+            if (!iw || !ih || !mpFill.getContext) return;
+            mpFill.width = W; mpFill.height = H;
+            var fctx = mpFill.getContext('2d');
+            var scale = Math.max(W / iw, H / ih);   // cover
+            var dw = iw * scale, dh = ih * scale;
+            fctx.clearRect(0, 0, W, H);
+            fctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+        }
+
         // Tear the motion poster down and free its layers. Safe to call anytime.
         function clearMotion(reason) {
             if (!motion.active && motion.raf === 0) return;
@@ -574,7 +603,7 @@
             motion.particles = [];
             mpBg.onload = null; mpBg.onerror = null; mpBg.src = '';
             mpSubject.onload = null; mpSubject.onerror = null; mpSubject.src = '';
-            mpFill.src = '';
+            if (mpFill.getContext) { mpFill.getContext('2d').clearRect(0, 0, mpFill.width, mpFill.height); }
             motionEl.classList.remove('active');
             tlog('info', 'motion cleared (' + (reason || '') + ')');
         }
@@ -793,6 +822,9 @@
                 particles: motion.particles.length,
                 bgLoaded: motion.bgLoaded,
                 subjectLoaded: motion.subjectLoaded,
+                rot: currentRotation,                                   // isolate rotation vs fps
+                fill: (motion.recipe && motion.recipe.fill) || '',
+                bgW: mpBg.naturalWidth || 0, bgH: mpBg.naturalHeight || 0,   // decoded bg resolution
                 heap: heapStats()
             });
         }
@@ -815,14 +847,15 @@
             // Whole container rotates like the other layers (portrait displays).
             styleRotation(motionEl, currentRotation);
 
-            // Fill mode: portrait poster → blurred fill behind + contain; else cover.
+            // Fill mode: portrait poster → soft fill behind + contain; else cover.
+            // The fill canvas is painted in mpBg.onload (below) once the bg
+            // image has decoded — see paintFill().
             if (recipe.fill === 'cover') {
                 mpBg.style.objectFit = 'cover';
                 mpFill.style.display = 'none';
             } else {
                 mpBg.style.objectFit = 'contain';
                 mpFill.style.display = 'block';
-                mpFill.src = recipe.bg;
             }
 
             // Colour grade wash (warm amber / cool blue via soft-light).
@@ -850,7 +883,11 @@
             }
 
             // Load images (plain <img>, no crossOrigin — the proven ingest).
-            mpBg.onload  = function() { motion.bgLoaded = true; tlog('verbose', 'motion bg loaded'); };
+            mpBg.onload  = function() {
+                motion.bgLoaded = true;
+                tlog('verbose', 'motion bg loaded ' + mpBg.naturalWidth + 'x' + mpBg.naturalHeight);
+                if (recipe.fill !== 'cover') { paintFill(mpBg); }
+            };
             mpBg.onerror = function() { tlog('error', 'motion bg FAILED ' + recipe.bg); broadcast('motionError', { phase: 'bg', url: recipe.bg }); };
             mpBg.src = recipe.bg;
 
