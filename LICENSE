@@ -1,0 +1,29 @@
+PosterCue Receiver — Proprietary License
+Copyright (c) 2026 Blue River Logic. All rights reserved.
+
+This repository and all of its contents (the "Software"), including the
+Google Cast receiver in index.html, are the exclusive property of
+Blue River Logic.
+
+The Software is published in a publicly viewable location ONLY because
+Google Cast requires a Custom Web Receiver to be served from a publicly
+reachable URL. Public visibility does NOT place the Software in the public
+domain and does NOT grant any license or right to use it.
+
+No permission is granted to any person or entity to use, copy, reproduce,
+modify, adapt, translate, publish, distribute, sublicense, create derivative
+works from, reverse engineer, or otherwise exploit the Software, in whole or
+in part, by any means or for any purpose, without the prior written
+permission of Blue River Logic.
+
+All rights not expressly granted are reserved.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Licensing inquiries: https://blueriverlogic.com/contact
