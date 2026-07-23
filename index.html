@@ -266,6 +266,14 @@
         // Used when a slideshow is stopped or the display is cleared, instead of
         // leaving the screen black.
         function showSplash() {
+            // The splash is the idle "nothing is showing" state, so make it a
+            // clean slate: tear down any motion poster (which sits above the
+            // canvas at z-index 6) and any running slideshow. Both are safe /
+            // idempotent no-ops when inactive. Without the clearMotion, stopping
+            // a slideshow (or clearing) could leave a motion poster superimposed
+            // over the placeholder.
+            clearMotion('splash');
+            clearSlideshow('splash');
             styleRotation(splash, currentRotation);
             splash.style.display = 'flex';
             canvas.style.display = 'none';
@@ -831,10 +839,14 @@
 
         // Build & start a motion poster from a recipe.
         function startMotion(recipe) {
+            // Stop any PRIOR motion immediately (safe — its raf is cancelled
+            // before we mutate the shared `motion` state below). But do NOT tear
+            // down the current single-image / slideshow surface or reveal #motion
+            // yet: hold whatever's on screen until the poster background has
+            // DECODED, then go live + hide the others inside mpBg.onload. Doing it
+            // eagerly here used to flash the motion container's black background
+            // before the poster finished loading.
             clearMotion('restart');
-            clearSlideshow('motion');            // motion supersedes any slideshow
-            splash.style.display = 'none';
-            canvas.style.display = 'none';
 
             motion.recipe = recipe;
             motion.loopMs = Math.max(2000, (recipe.loopSeconds || 12) * 1000);
@@ -887,6 +899,18 @@
                 motion.bgLoaded = true;
                 tlog('verbose', 'motion bg loaded ' + mpBg.naturalWidth + 'x' + mpBg.naturalHeight);
                 if (recipe.fill !== 'cover') { paintFill(mpBg); }
+                // Poster decoded — NOW reveal motion and tear down the other
+                // surfaces (held until this moment so the prior image/slideshow
+                // stayed visible instead of a black flash).
+                clearSlideshow('motion');            // motion supersedes any slideshow
+                splash.style.display = 'none';
+                canvas.style.display = 'none';
+                motionEl.classList.add('active');
+                motion.active = true;
+                motion.startTs = 0; motion.lastTs = 0;
+                motion.frames = 0; motion.fpsWindowFrames = 0;
+                if (!motion.raf)       motion.raf = requestAnimationFrame(motionTick);
+                if (!motion.heartbeat) motion.heartbeat = setInterval(motionHeartbeat, 5000);
             };
             mpBg.onerror = function() { tlog('error', 'motion bg FAILED ' + recipe.bg); broadcast('motionError', { phase: 'bg', url: recipe.bg }); };
             mpBg.src = recipe.bg;
@@ -903,13 +927,8 @@
 
             setupParticles(recipe.particle || {});
 
-            // Go.
-            motionEl.classList.add('active');
-            motion.active = true;
-            motion.startTs = 0; motion.lastTs = 0;
-            motion.frames = 0; motion.fpsWindowFrames = 0;
-            motion.raf = requestAnimationFrame(motionTick);
-            motion.heartbeat = setInterval(motionHeartbeat, 5000);
+            // NB: motion goes live in mpBg.onload above — once the poster has
+            // decoded — not here, so the previous surface holds until it's ready.
         }
 
         context.addCustomMessageListener(NAMESPACE, function(event) {
@@ -922,10 +941,19 @@
             if (data.action === 'show') {
                 // A single image (album art, movie poster, auto-push) permanently
                 // stops any running slideshow / motion poster and displays it.
-                clearSlideshow('single-image');
-                clearMotion('single-image');
-                canvas.style.display = 'block';
+                //
+                // Switch surfaces ATOMICALLY once the new image has DECODED:
+                // whatever is currently on screen — a motion poster, the prior
+                // single image, or a slideshow — is held until then, and the
+                // teardown + reveal + double-buffer swap all happen in one
+                // synchronous turn inside onload. Revealing the canvas (or
+                // clearing motion) BEFORE the new image loaded used to briefly
+                // paint the stale previous frame. Image→image crossfade is
+                // unchanged (the inactive-mode teardowns are no-ops there); on a
+                // load failure the current surface simply stays up.
                 standbyImg.onload = function() {
+                    clearSlideshow('single-image');
+                    clearMotion('single-image');
                     splash.style.display = 'none';
                     canvas.style.display = 'block';
                     activeImg.classList.remove('active');
