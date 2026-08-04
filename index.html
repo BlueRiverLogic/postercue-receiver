@@ -1018,7 +1018,12 @@
             videoMedia.loop = loop;
             videoMedia.muted = true;                                  // required for gesture-free autoplay
             videoMedia.style.objectFit = (data.fill === 'cover') ? 'cover' : 'contain';
-            styleRotation(videoEl, currentRotation);                  // portrait displays stay upright
+            // The <video> is ALWAYS a landscape frame filling the Cast signal.
+            // Hardware video decoders reject tall (portrait) frames, so for a
+            // portrait mount the sender pre-rotates the pixels into a landscape
+            // frame (same as the Samsung Frame path). We therefore never rotate
+            // the video element itself — identity transform, regardless of mount.
+            styleRotation(videoEl, 0);
 
             tlog('info', 'video start: ' + data.url + ' loop=' + loop + ' fill=' + (data.fill || 'contain'));
 
@@ -1136,9 +1141,10 @@
 
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
-                // Keep a live motion poster / video upright too if orientation changes.
+                // Keep a live motion poster upright too if orientation changes.
+                // (Video is never rotated here — its pixels are pre-rotated by
+                // the sender to keep the encoded frame landscape/decoder-safe.)
                 if (motion.active) styleRotation(motionEl, data.rotation || 0);
-                if (video.active) styleRotation(videoEl, data.rotation || 0);
                 // Remember it for this device so the next cold start paints the
                 // placeholder in the right orientation immediately (no flash).
                 try { localStorage.setItem('pc_rotation', String(currentRotation)); } catch (e) {}
