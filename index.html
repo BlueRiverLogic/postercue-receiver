@@ -101,6 +101,28 @@
         #mp-vignette{ position: absolute; top: 0; left: 0; width: 100%; height: 100%;
                       pointer-events: none; opacity: 0;
                       background: radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.92) 130%); }
+
+        /* ── Video surface (hardware video plane) ────────────────────────
+           A real <video> element decoded by the device's dedicated video
+           hardware — the ONLY path to true 4K on Cast (the <img>/<canvas>
+           graphics plane is platform-capped at ~1080p), and the only thing
+           that keeps built-in TV screensavers (e.g. LG webOS) from starting
+           over otherwise-static content. Rotated as a whole like #motion so
+           portrait displays stay upright. */
+        #video {
+            position: absolute; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            display: none; overflow: hidden; background: #000;
+            z-index: 8;
+            will-change: transform;
+            backface-visibility: hidden;
+        }
+        #video.active { display: block; }
+        #video-el {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%;
+            object-fit: contain; background: #000;
+        }
     </style>
 </head>
 <body>
@@ -132,6 +154,13 @@
         <div    id="mp-sweep"></div>
         <div    id="mp-grade"></div>
         <div    id="mp-vignette"></div>
+    </div>
+
+    <!-- Video surface: real <video> on the hardware video plane (4K-capable,
+         screensaver-suppressing). muted+playsinline+autoplay so it can start
+         without a user gesture; loop for seamless keep-alive / motion loops. -->
+    <div id="video">
+        <video id="video-el" muted loop autoplay playsinline preload="auto"></video>
     </div>
 
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
@@ -274,6 +303,7 @@
             // over the placeholder.
             clearMotion('splash');
             clearSlideshow('splash');
+            clearVideo('splash');
             styleRotation(splash, currentRotation);
             splash.style.display = 'flex';
             canvas.style.display = 'none';
@@ -452,6 +482,7 @@
         function startSlideshow(data) {
             clearSlideshow('restart');               // tear down any prior show first
             clearMotion('slideshow');                // and any running motion poster
+            clearVideo('slideshow');                 // …and any playing video
 
             // Hide the single-image layers; the slideshow uses its own layers
             // inside the same #canvas, so it inherits orientation/rotation.
@@ -903,6 +934,7 @@
                 // surfaces (held until this moment so the prior image/slideshow
                 // stayed visible instead of a black flash).
                 clearSlideshow('motion');            // motion supersedes any slideshow
+                clearVideo('motion');                // …and any playing video
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 motionEl.classList.add('active');
@@ -931,6 +963,101 @@
             // decoded — not here, so the previous surface holds until it's ready.
         }
 
+        // ══ Video engine ═══════════════════════════════════════════════
+        //
+        // Plays a real H.264/HEVC <video> served over plain HTTP from the
+        // phone. Uses the device's hardware VIDEO plane, which (a) can render
+        // true 4K — the <img>/<canvas> graphics plane cannot — and (b) counts
+        // as "playing video full screen", so TV screensavers stay away.
+        //
+        // Same last-wins contract as the other surfaces: hold whatever is on
+        // screen until the new video can actually play, THEN switch, so there
+        // is no black flash while it buffers. <video src> needs no canvas
+        // pixel reads, so it sidesteps the CORS wall the image paths work around.
+
+        var videoEl    = document.getElementById('video');       // rotated container
+        var videoMedia = document.getElementById('video-el');    // the <video> element
+
+        var video = { active: false, url: null, heartbeat: null };
+
+        // Tear the video down and RELEASE the hardware decoder. Safe anytime.
+        function clearVideo(reason) {
+            if (!video.active && !video.url) return;
+            if (video.heartbeat) { clearInterval(video.heartbeat); video.heartbeat = null; }
+            videoMedia.oncanplay = null; videoMedia.onplaying = null; videoMedia.onerror = null;
+            try { videoMedia.pause(); } catch (e) {}
+            videoMedia.removeAttribute('src');
+            try { videoMedia.load(); } catch (e) {}   // frees the decoder + buffered data
+            video.active = false;
+            video.url = null;
+            videoEl.classList.remove('active');
+            tlog('info', 'video cleared (' + (reason || '') + ')');
+        }
+
+        // Periodic health beat. videoWidth/videoHeight are the DECODED frame
+        // dimensions — the ground-truth proof of 4K on the video plane (the
+        // graphics-plane getInfo can only ever report ~1080p).
+        function videoHeartbeat() {
+            if (!video.active) return;
+            broadcast('videoHeartbeat', {
+                currentTime: +(videoMedia.currentTime || 0).toFixed(2),
+                paused: videoMedia.paused,
+                vw: videoMedia.videoWidth || 0,
+                vh: videoMedia.videoHeight || 0,
+                rot: currentRotation,
+                heap: heapStats()
+            });
+        }
+
+        // Build & start a video from { url, loop, fill }.
+        function startVideo(data) {
+            clearVideo('restart');   // stop any prior video; hold on-screen surface until canplay
+
+            video.url = data.url;
+            var loop = data.loop !== false;
+            videoMedia.loop = loop;
+            videoMedia.muted = true;                                  // required for gesture-free autoplay
+            videoMedia.style.objectFit = (data.fill === 'cover') ? 'cover' : 'contain';
+            styleRotation(videoEl, currentRotation);                  // portrait displays stay upright
+
+            tlog('info', 'video start: ' + data.url + ' loop=' + loop + ' fill=' + (data.fill || 'contain'));
+
+            videoMedia.oncanplay = function() {
+                // Ready to play — reveal video and tear down the other surfaces
+                // in one synchronous turn (no black flash while buffering).
+                clearSlideshow('video');
+                clearMotion('video');
+                splash.style.display = 'none';
+                canvas.style.display = 'none';
+                videoEl.classList.add('active');
+                video.active = true;
+                var p = videoMedia.play();
+                if (p && p.catch) {
+                    p.catch(function(err) {
+                        tlog('error', 'video play() rejected: ' + err);
+                        broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
+                    });
+                }
+                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
+            };
+            videoMedia.onplaying = function() {
+                tlog('info', 'video playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0));
+                broadcast('videoPlaying', {
+                    url: video.url,
+                    vw: videoMedia.videoWidth || 0,
+                    vh: videoMedia.videoHeight || 0,
+                    ts: Date.now()
+                });
+            };
+            videoMedia.onerror = function() {
+                var err = videoMedia.error;
+                tlog('error', 'video error code=' + (err && err.code) + ' ' + data.url);
+                broadcast('videoError', { phase: 'load', code: err && err.code, url: data.url });
+            };
+            videoMedia.src = data.url;
+            try { videoMedia.load(); } catch (e) {}
+        }
+
         context.addCustomMessageListener(NAMESPACE, function(event) {
             var receivedAt = Date.now();
             var data = event.data;
@@ -954,6 +1081,7 @@
                 standbyImg.onload = function() {
                     clearSlideshow('single-image');
                     clearMotion('single-image');
+                    clearVideo('single-image');
                     splash.style.display = 'none';
                     canvas.style.display = 'block';
                     activeImg.classList.remove('active');
@@ -993,10 +1121,24 @@
                 });
             }
 
+            else if (data.action === 'showVideo') {
+                // Real video on the hardware video plane (4K-capable, screensaver-
+                // suppressing). Supersedes any image / slideshow / motion poster.
+                startVideo(data);
+                sendMessage(event.senderId, {
+                    event: 'videoStarted',
+                    url: data.url,
+                    loop: data.loop !== false,
+                    ts: Date.now(),
+                    processingMs: Date.now() - receivedAt
+                });
+            }
+
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
-                // Keep a live motion poster upright too if orientation changes.
+                // Keep a live motion poster / video upright too if orientation changes.
                 if (motion.active) styleRotation(motionEl, data.rotation || 0);
+                if (video.active) styleRotation(videoEl, data.rotation || 0);
                 // Remember it for this device so the next cold start paints the
                 // placeholder in the right orientation immediately (no flash).
                 try { localStorage.setItem('pc_rotation', String(currentRotation)); } catch (e) {}
@@ -1011,6 +1153,7 @@
             else if (data.action === 'clear') {
                 clearSlideshow('clear-command');
                 clearMotion('clear-command');
+                clearVideo('clear-command');
                 // Detach load/error handlers BEFORE clearing src —
                 // setting src='' triggers onerror, which would fire
                 // the stale handler from the last 'show' command and
