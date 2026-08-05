@@ -1170,6 +1170,7 @@
             if (blobBeat) return;
             blobBeatTick = 0;
             var lastInbound = inboundMsgCount;
+            var lastStallReceived = -1, stallTicks = 0;
             blobBeat = setInterval(function() {
                 blobBeatTick++;
                 var delta = inboundMsgCount - lastInbound;
@@ -1187,6 +1188,25 @@
                     heapPct:     h ? h.pct : null
                 });
                 blobDecodeSumMs = 0; blobDecodeMaxMs = 0; blobChunksWin = 0;
+
+                // Zombie/stall self-termination: if an incomplete transfer makes no
+                // progress for ~10s the inbound pipe has died (poisoned socket) — stop
+                // the beat, drop the partial buffer, and tell any sender. Without this
+                // the interval runs forever and its stale beats mask the dead socket.
+                if (blobXfer && blobXfer.received < blobXfer.total) {
+                    if (blobXfer.received === lastStallReceived) {
+                        if (++stallTicks >= 10) {
+                            tlog('error', 'blob STALLED — no progress 10s at ' + blobXfer.received + '/' + blobXfer.total + ' — aborting');
+                            broadcast('blobStalled', { received: blobXfer.received, total: blobXfer.total });
+                            blobXfer = null;
+                            stopBlobBeat();
+                        }
+                    } else {
+                        stallTicks = 0; lastStallReceived = blobXfer.received;
+                    }
+                } else {
+                    stallTicks = 0;
+                }
             }, 1000);
         }
         function stopBlobBeat() {
