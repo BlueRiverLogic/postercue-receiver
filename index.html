@@ -1150,21 +1150,17 @@
         // so playback SURVIVES the sender/app (and its HTTP server) going away.
         var blobXfer = null;   // { id, total, bytes, parts[](Uint8Array), received, fill, loop, startAt }
 
-        // ── Blob transfer INSTRUMENTATION (diagnosing the mid-stream wedge) ──
-        // The wedge signature is: acks AND heartbeat PONGs stop simultaneously. Both
-        // are emitted by JS on THIS single event loop, so that's one failure — the loop
-        // stopped servicing callbacks. `blobBeat` is a setInterval INDEPENDENT of chunk
-        // arrival: if it keeps ticking while acks stop, the loop is alive (transport or
-        // listener issue); if it stops with the acks, the loop itself froze — and the
-        // per-window decode time / inbound-message count says why.
-        var inboundMsgCount   = 0;   // every custom message ever received (delta'd per beat)
-        var blobBeat          = null;
-        var blobBeatTick      = 0;
-        var blobDecodeSumMs   = 0;   // ms spent in atob/copy this beat window
-        var blobDecodeMaxMs   = 0;   // slowest single chunk this beat window
-        var blobChunksWin     = 0;   // chunks decoded this beat window
-        var blobNow = (window.performance && performance.now)
-            ? function() { return performance.now(); } : function() { return Date.now(); };
+        // ── Blob transfer liveness heartbeat ──
+        // `blobBeat` is a 1/s setInterval INDEPENDENT of chunk arrival — the sender's
+        // hiccup detector. If beats keep arriving while `received` stays frozen and
+        // `inMsgs == 0`, the device's inbound pipe has silently died (a fresh socket
+        // clears it) and the sender reconnects + resumes. `inMsgs` = inbound custom
+        // messages since the last beat (delta of `inboundMsgCount`). Kept deliberately
+        // LEAN: the per-chunk decode-timing and heap fields were investigation-only and
+        // have been removed to cut receiver CPU + channel chatter on weak devices.
+        var inboundMsgCount = 0;   // every inbound custom message (delta'd per beat)
+        var blobBeat        = null;
+        var blobBeatTick    = 0;
 
         function startBlobBeat() {
             if (blobBeat) return;
@@ -1175,19 +1171,12 @@
                 blobBeatTick++;
                 var delta = inboundMsgCount - lastInbound;
                 lastInbound = inboundMsgCount;
-                var h = heapStats();
                 broadcast('blobBeat', {
-                    tick:        blobBeatTick,
-                    received:    blobXfer ? blobXfer.received : -1,
-                    total:       blobXfer ? blobXfer.total : -1,
-                    inMsgs:      delta,
-                    chunksWin:   blobChunksWin,
-                    decodeMsWin: +blobDecodeSumMs.toFixed(1),
-                    chunkMaxMs:  +blobDecodeMaxMs.toFixed(2),
-                    heapUsedMB:  h ? Math.round(h.used / 1048576) : null,
-                    heapPct:     h ? h.pct : null
+                    tick:     blobBeatTick,
+                    received: blobXfer ? blobXfer.received : -1,
+                    total:    blobXfer ? blobXfer.total : -1,
+                    inMsgs:   delta
                 });
-                blobDecodeSumMs = 0; blobDecodeMaxMs = 0; blobChunksWin = 0;
 
                 // Zombie/stall self-termination: if an incomplete transfer makes no
                 // progress for ~10s the inbound pipe has died (poisoned socket) — stop
@@ -1224,7 +1213,6 @@
                     blobXfer = { id: data.id, total: data.chunks || 0, bytes: data.bytes || 0,
                                  parts: new Array(data.chunks || 0), received: 0,
                                  fill: data.fill || 'cover', loop: data.loop !== false, startAt: Date.now() };
-                    blobDecodeSumMs = 0; blobDecodeMaxMs = 0; blobChunksWin = 0;
                 }
                 var have = 0;
                 for (var r = 0; r < blobXfer.total; r++) { if (blobXfer.parts[r] !== undefined) have++; }
@@ -1239,13 +1227,13 @@
                          parts: new Array(data.chunks || 0), received: 0,
                          fill: data.fill || 'cover', loop: data.loop !== false, startAt: Date.now() };
             tlog('info', 'blob begin id=' + data.id + ' chunks=' + data.chunks + ' bytes=' + data.bytes);
-            blobDecodeSumMs = 0; blobDecodeMaxMs = 0; blobChunksWin = 0;
             startBlobBeat();
         }
         function handleVideoBlobChunk(data) {
             if (!blobXfer || blobXfer.id !== data.id) return;
             if (blobXfer.parts[data.i] === undefined) {
-                var t0 = blobNow();
+                // Decode straight to bytes — NO per-chunk timing instrumentation (it ran on
+                // every one of ~45 chunks/s purely for the wedge investigation, now done).
                 try {
                     var bin = atob(data.d);
                     var u = new Uint8Array(bin.length);
@@ -1258,20 +1246,13 @@
                     // the log channel, and it looks identical to an event-loop freeze.
                     broadcast('fatal', { message: 'blob chunk decode failed i=' + data.i + ': ' + String(e), phase: 'blobChunk' });
                 }
-                var dt = blobNow() - t0;                     // per-window CPU accounting for the beat
-                blobDecodeSumMs += dt; blobChunksWin++;
-                if (dt > blobDecodeMaxMs) blobDecodeMaxMs = dt;
             }
-            // Ack every 2 chunks so the sender's SMALL in-flight window keeps advancing.
-            // The window is now only ~2–4 chunks deep (24 KB each), so an every-8 ack
-            // would starve it into a deadlock. Chunks are big/few now, so every-2 acks are
-            // cheap (~800 for a 37 MB show).
+            // Ack every 2 chunks so the sender's SMALL in-flight window (2–4 chunks of
+            // 24 KB) keeps advancing — an every-8 ack would starve it into a deadlock.
+            // No separate `videoBlobProgress` message: the sender derives the "Sending X%"
+            // UI from its own acked count (halves receiver→sender chatter on weak devices).
             if (blobXfer.received % 2 === 0 || blobXfer.received === blobXfer.total) {
                 broadcast('blobAck', { id: blobXfer.id, received: blobXfer.received });
-            }
-            if (blobXfer.received % 50 === 0 || blobXfer.received === blobXfer.total) {
-                var pct = blobXfer.total ? Math.round(blobXfer.received / blobXfer.total * 100) : 0;
-                broadcast('videoBlobProgress', { received: blobXfer.received, total: blobXfer.total, pct: pct });
             }
         }
         function handleVideoBlobEnd(data) {
