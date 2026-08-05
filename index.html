@@ -1214,6 +1214,27 @@
         }
 
         function handleVideoBlobBegin(data) {
+            // RESUME: the sender hiccupped and reconnected. If this id's partial transfer is
+            // still here, KEEP the received parts and report our count so the sender continues
+            // from there. If we lost it (id mismatch / zombie-terminated during a long
+            // reconnect), start fresh and report received=0 so the sender restarts at 0 —
+            // NEVER let the sender resume past chunks we don't hold.
+            if (data.resume) {
+                if (!(blobXfer && blobXfer.id === data.id)) {
+                    blobXfer = { id: data.id, total: data.chunks || 0, bytes: data.bytes || 0,
+                                 parts: new Array(data.chunks || 0), received: 0,
+                                 fill: data.fill || 'cover', loop: data.loop !== false, startAt: Date.now() };
+                    blobDecodeSumMs = 0; blobDecodeMaxMs = 0; blobChunksWin = 0;
+                }
+                var have = 0;
+                for (var r = 0; r < blobXfer.total; r++) { if (blobXfer.parts[r] !== undefined) have++; }
+                blobXfer.received = have;
+                tlog('info', 'blob RESUME id=' + data.id + ' — receiver holds ' + have + '/' + blobXfer.total);
+                broadcast('blobResumed', { id: data.id, received: have, total: blobXfer.total });
+                startBlobBeat();   // idempotent (guarded); restarts if the zombie timer stopped it
+                return;
+            }
+            // Fresh transfer.
             blobXfer = { id: data.id, total: data.chunks || 0, bytes: data.bytes || 0,
                          parts: new Array(data.chunks || 0), received: 0,
                          fill: data.fill || 'cover', loop: data.loop !== false, startAt: Date.now() };
