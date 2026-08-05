@@ -233,6 +233,31 @@
                 document.hidden ? 'documentHidden' : 'documentVisible');
         });
 
+        // Memory hygiene: when the RECEIVER itself is backgrounded (Home button on
+        // the streamer, launcher overlay), it's no longer showing anything, so free a
+        // resident blob show after a short grace period. Debounced — a brief overlay
+        // or accidental Home press that returns within the window keeps the show.
+        //
+        // This does NOT affect survive-app-close: when the *phone* (sender) closes, the
+        // receiver stays FOREGROUND (document.hidden = false) and keeps playing — only
+        // the receiver going to background trips this. showSplash() tears down video
+        // (revoking the Blob), slideshow, and motion, so the ~45 MB is released.
+        var bgClearTimer = null;
+        var BG_CLEAR_GRACE_MS = 20000;
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                if (bgClearTimer) return;
+                bgClearTimer = setTimeout(function() {
+                    bgClearTimer = null;
+                    if (!document.hidden) return;   // came back within grace — keep it
+                    tlog('info', 'receiver backgrounded > ' + (BG_CLEAR_GRACE_MS / 1000) + 's — clearing to free memory');
+                    showSplash();
+                }, BG_CLEAR_GRACE_MS);
+            } else if (bgClearTimer) {
+                clearTimeout(bgClearTimer); bgClearTimer = null;
+            }
+        });
+
         // Source 2: Cast SDK VISIBILITY_CHANGED — fires when the HDMI
         // input changes (user switches TV input away from Cast device)
         // or the TV powers off. Distinct from Page Visibility API which
@@ -1040,6 +1065,14 @@
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.removeAttribute('src');
             try { videoMedia.load(); } catch (e) {}   // frees the decoder + buffered data
+            // Release the in-RAM Blob. An object URL holds a STRONG reference to its
+            // Blob, so without revoke the (up to ~45 MB) slideshow video stays resident
+            // forever — every push routes through clearVideo(), so this frees the old
+            // show whenever anything (image / new show / stop / clear / splash) replaces
+            // it. Without it the receiver accumulated blobs until it degraded.
+            if (video.url && video.url.indexOf('blob:') === 0) {
+                try { URL.revokeObjectURL(video.url); } catch (e) {}
+            }
             video.active = false;
             video.url = null;
             videoEl.classList.remove('active');
