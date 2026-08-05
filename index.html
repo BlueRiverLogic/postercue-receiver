@@ -978,13 +978,40 @@
         var videoEl    = document.getElementById('video');       // rotated container
         var videoMedia = document.getElementById('video-el');    // the <video> element
 
-        var video = { active: false, url: null, heartbeat: null };
+        var video = { active: false, url: null, heartbeat: null, fullyBuffered: false };
+
+        // How much of the clip the media element has cached from the start, and
+        // whether the WHOLE file is buffered — the true "the receiver has the
+        // entire show and no longer needs the phone" (safe-to-close) predicate.
+        function bufferedInfo() {
+            var dur = videoMedia.duration || 0;
+            var be  = (videoMedia.buffered && videoMedia.buffered.length)
+                ? videoMedia.buffered.end(videoMedia.buffered.length - 1) : 0;
+            var pct = dur > 0 ? Math.min(100, Math.round(be / dur * 100)) : 0;
+            return { dur: dur, be: be, pct: pct };
+        }
+
+        // Fires the one-shot `videoBuffered` event once the entire clip is cached.
+        // For a long clip the media element may only buffer a window ahead and
+        // stream the rest — in which case this never fires, which is exactly the
+        // signal the sender needs ("this TV did NOT fully cache — keep app open").
+        function checkVideoBuffered() {
+            if (!video.url || video.fullyBuffered) return;
+            var b = bufferedInfo();
+            if (b.dur > 0 && b.be >= b.dur - 0.5) {
+                video.fullyBuffered = true;
+                broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be.toFixed(2), pct: 100 });
+                tlog('info', 'video FULLY buffered (' + b.dur.toFixed(1) + 's) — safe to close sender');
+            }
+        }
 
         // Tear the video down and RELEASE the hardware decoder. Safe anytime.
         function clearVideo(reason) {
             if (!video.active && !video.url) return;
             if (video.heartbeat) { clearInterval(video.heartbeat); video.heartbeat = null; }
             videoMedia.oncanplay = null; videoMedia.onplaying = null; videoMedia.onerror = null;
+            videoMedia.onprogress = null;
+            video.fullyBuffered = false;
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.removeAttribute('src');
             try { videoMedia.load(); } catch (e) {}   // frees the decoder + buffered data
@@ -999,12 +1026,14 @@
         // graphics-plane getInfo can only ever report ~1080p).
         function videoHeartbeat() {
             if (!video.active) return;
+            checkVideoBuffered();
             broadcast('videoHeartbeat', {
                 currentTime: +(videoMedia.currentTime || 0).toFixed(2),
                 paused: videoMedia.paused,
                 vw: videoMedia.videoWidth || 0,
                 vh: videoMedia.videoHeight || 0,
                 rot: currentRotation,
+                bufferedPct: bufferedInfo().pct,
                 heap: heapStats()
             });
         }
@@ -1014,6 +1043,10 @@
             clearVideo('restart');   // stop any prior video; hold on-screen surface until canplay
 
             video.url = data.url;
+            video.fullyBuffered = false;
+            // `progress` fires as more of the file caches — the earliest, most
+            // responsive place to detect full buffering (heartbeat also polls).
+            videoMedia.onprogress = checkVideoBuffered;
             var loop = data.loop !== false;
             videoMedia.loop = loop;
             videoMedia.muted = true;                                  // required for gesture-free autoplay
