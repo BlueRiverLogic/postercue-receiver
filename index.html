@@ -989,6 +989,7 @@
             var tr  = videoMedia.buffered;
             var n   = (tr && tr.length) ? tr.length : 0;
             var bs  = n ? tr.start(0) : 0;                 // start of the FIRST range
+            var be0 = n ? tr.end(0) : 0;                   // end of the FIRST (contiguous-from-start) range
             var be  = n ? tr.end(n - 1) : 0;               // end of the LAST range
             // Total contiguous seconds actually held (sum of all ranges) — the true
             // "retained" amount. If the file is fully cached this ≈ duration; if the
@@ -1001,7 +1002,12 @@
             var rangesStr = '';
             for (var j = 0; j < n && j < 6; j++) rangesStr += '[' + tr.start(j).toFixed(0) + '-' + tr.end(j).toFixed(0) + ']';
             if (n > 6) rangesStr += '…+' + (n - 6);
-            return { dur: dur, be: be, bs: bs, pct: pct, ranges: n, held: held, heldPct: heldPct, rangesStr: rangesStr };
+            // Contiguous-from-start coverage: the ONLY retention that guarantees a
+            // seamless loop with no re-fetch. `be0 >= dur` (with bs≈0) means one solid
+            // range [0..duration]. This — not `be` reaching the end — is safe-to-close.
+            var contiguousPct = dur > 0 ? Math.min(100, Math.round(be0 / dur * 100)) : 0;
+            return { dur: dur, be: be, be0: be0, bs: bs, pct: pct, ranges: n,
+                     held: held, heldPct: heldPct, contiguousPct: contiguousPct, rangesStr: rangesStr };
         }
 
         // Fires the one-shot `videoBuffered` event once the entire clip is cached.
@@ -1011,10 +1017,12 @@
         function checkVideoBuffered() {
             if (!video.url || video.fullyBuffered) return;
             var b = bufferedInfo();
-            if (b.dur > 0 && b.be >= b.dur - 0.5) {
+            // Require ONE contiguous range [0..duration] — not merely the end reached
+            // (seek-ahead can leave mid-file holes, which fail on loop → re-fetch → crash).
+            if (b.dur > 0 && b.bs <= 0.5 && b.be0 >= b.dur - 0.5) {
                 video.fullyBuffered = true;
-                broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be.toFixed(2), pct: 100 });
-                tlog('info', 'video FULLY buffered (' + b.dur.toFixed(1) + 's) — safe to close sender');
+                broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be0.toFixed(2), pct: 100 });
+                tlog('info', 'video FULLY buffered contiguous (' + b.dur.toFixed(1) + 's) — safe to close sender');
             }
         }
 
@@ -1123,37 +1131,43 @@
                 var now = Date.now();
                 var elapsed = (now - video.preloadStartAt) / 1000;
 
-                if (b.pct !== lastPct) {
-                    var rate = (b.be - lastBe) / (((now - lastBeAt) / 1000) || 1);   // content-sec cached per wall-sec
-                    broadcast('videoPreload', { pct: b.pct, bufferedSec: +b.be.toFixed(1), durationSec: +b.dur.toFixed(1),
+                // Progress is measured on the CONTIGUOUS-from-start edge (be0), the
+                // only bytes that count for a seamless loop. `be`/ranges are logged too
+                // so we can still see any holes.
+                if (b.contiguousPct !== lastPct) {
+                    var rate = (b.be0 - lastBe) / (((now - lastBeAt) / 1000) || 1);   // contiguous-sec cached per wall-sec
+                    broadcast('videoPreload', { pct: b.contiguousPct, bufferedSec: +b.be0.toFixed(1), durationSec: +b.dur.toFixed(1),
                                                 elapsedSec: +elapsed.toFixed(1), rate: +rate.toFixed(2),
-                                                playhead: +(videoMedia.currentTime || 0).toFixed(1) });
-                    tlog('info', 'preload ' + b.pct + '% (' + b.be.toFixed(0) + '/' + b.dur.toFixed(0) + 's) elapsed=' +
-                                 elapsed.toFixed(0) + 's rate=' + rate.toFixed(1) + 'x realtime, playhead=' +
-                                 (videoMedia.currentTime || 0).toFixed(0) + 's');
-                    lastPct = b.pct; lastBe = b.be; lastBeAt = now;
+                                                ranges: b.ranges, endPct: b.pct, playhead: +(videoMedia.currentTime || 0).toFixed(1) });
+                    tlog('info', 'preload ' + b.contiguousPct + '% contiguous (' + b.be0.toFixed(0) + '/' + b.dur.toFixed(0) +
+                                 's, ' + b.ranges + ' ranges, end ' + b.pct + '%) elapsed=' + elapsed.toFixed(0) +
+                                 's rate=' + rate.toFixed(1) + 'x realtime');
+                    lastPct = b.contiguousPct; lastBe = b.be0; lastBeAt = now;
                 }
 
-                if (b.dur > 0 && b.be >= b.dur - 0.5) {
+                // Fully cached only when ONE contiguous range covers [0..duration].
+                if (b.dur > 0 && b.bs <= 0.5 && b.be0 >= b.dur - 0.5) {
                     video.fullyBuffered = true;
-                    broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be.toFixed(2),
+                    broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be0.toFixed(2),
                                                  pct: 100, elapsedSec: +elapsed.toFixed(1), viaPreload: true });
-                    tlog('info', 'video FULLY buffered via seek-ahead in ' + elapsed.toFixed(1) + 's — safe to close sender');
+                    tlog('info', 'video FULLY buffered (contiguous) via seek-ahead in ' + elapsed.toFixed(1) + 's — safe to close sender');
                     reveal('fully-buffered');
                     return;
                 }
                 if (now - video.preloadStartAt > PRELOAD_TIMEOUT_MS) {
-                    broadcast('videoPreloadTimeout', { pct: b.pct, elapsedSec: +elapsed.toFixed(1) });
-                    tlog('error', 'preload TIMEOUT at ' + b.pct + '% after ' + elapsed.toFixed(0) + 's — streaming (NOT fully cached)');
+                    broadcast('videoPreloadTimeout', { pct: b.contiguousPct, elapsedSec: +elapsed.toFixed(1) });
+                    tlog('error', 'preload TIMEOUT at ' + b.contiguousPct + '% contiguous after ' + elapsed.toFixed(0) + 's — streaming (NOT fully cached)');
                     reveal('timeout');
                     return;
                 }
 
-                // Seek-ahead: pin the playhead just behind the buffered edge so the
-                // media engine keeps pulling forward at full speed.
+                // Seek-ahead: pin the playhead just behind the CONTIGUOUS-from-start
+                // edge (be0), not the last range — jumping to the last range's end skips
+                // bytes and leaves mid-file holes. Staying at be0 forces the engine to
+                // extend [0..x] solid, so the file fills with no gaps.
                 try {
-                    if (b.dur > 0 && b.be > 0.1 && b.be < b.dur - 0.5) {
-                        var target = Math.max(0, b.be - 0.05);
+                    if (b.dur > 0 && b.be0 > 0.1 && b.be0 < b.dur - 0.5) {
+                        var target = Math.max(0, b.be0 - 0.05);
                         if (Math.abs((videoMedia.currentTime || 0) - target) > 0.1) videoMedia.currentTime = target;
                     }
                 } catch (e) {}
