@@ -978,7 +978,8 @@
         var videoEl    = document.getElementById('video');       // rotated container
         var videoMedia = document.getElementById('video-el');    // the <video> element
 
-        var video = { active: false, url: null, heartbeat: null, fullyBuffered: false };
+        var video = { active: false, url: null, heartbeat: null, fullyBuffered: false,
+                      preloading: false, preloadTimer: null, preloadStartAt: 0 };
 
         // How much of the clip the media element has cached from the start, and
         // whether the WHOLE file is buffered — the true "the receiver has the
@@ -1009,6 +1010,8 @@
         function clearVideo(reason) {
             if (!video.active && !video.url) return;
             if (video.heartbeat) { clearInterval(video.heartbeat); video.heartbeat = null; }
+            if (video.preloadTimer) { clearInterval(video.preloadTimer); video.preloadTimer = null; }
+            video.preloading = false;
             videoMedia.oncanplay = null; videoMedia.onplaying = null; videoMedia.onerror = null;
             videoMedia.onprogress = null;
             video.fullyBuffered = false;
@@ -1039,30 +1042,43 @@
         }
 
         // Build & start a video from { url, loop, fill }.
+        //
+        // FORCE-DOWNLOAD PRELOAD: the HTML5 <video> progressive loader throttles a
+        // long clip to ~real-time, so a 15-min slideshow takes ~9 min to fully
+        // cache — too slow for "close the app." We defeat that by playing the clip
+        // HIDDEN + muted with the playhead pinned just behind the buffered edge
+        // (seek-ahead), which makes the media engine pull the whole file at full
+        // LAN speed. Only once the ENTIRE clip is cached do we reveal + loop it
+        // (true safe-to-close). Rich per-tick logging reports the real download
+        // rate so we can tell if Cast's Chrome honours the seek-ahead or re-throttles.
         function startVideo(data) {
-            clearVideo('restart');   // stop any prior video; hold on-screen surface until canplay
+            clearVideo('restart');   // stop any prior video; hold on-screen surface until reveal
 
             video.url = data.url;
             video.fullyBuffered = false;
-            // `progress` fires as more of the file caches — the earliest, most
-            // responsive place to detect full buffering (heartbeat also polls).
-            videoMedia.onprogress = checkVideoBuffered;
+            video.preloading = true;
+            video.preloadStartAt = Date.now();
             var loop = data.loop !== false;
-            videoMedia.loop = loop;
+            videoMedia.loop = false;                                  // no looping mid-preload (would reset buffer)
             videoMedia.muted = true;                                  // required for gesture-free autoplay
             videoMedia.style.objectFit = (data.fill === 'cover') ? 'cover' : 'contain';
             // The <video> is ALWAYS a landscape frame filling the Cast signal.
             // Hardware video decoders reject tall (portrait) frames, so for a
             // portrait mount the sender pre-rotates the pixels into a landscape
-            // frame (same as the Samsung Frame path). We therefore never rotate
-            // the video element itself — identity transform, regardless of mount.
+            // frame (same as the Samsung Frame path). We never rotate the element.
             styleRotation(videoEl, 0);
 
-            tlog('info', 'video start: ' + data.url + ' loop=' + loop + ' fill=' + (data.fill || 'contain'));
+            // TESTING: very long so we always see the true buffering curve to 100%
+            // instead of bailing to streaming early. Tighten for production.
+            var PRELOAD_TIMEOUT_MS = 1800000;   // 30 min
+            var lastPct = -1, lastBe = 0, lastBeAt = Date.now();
 
-            videoMedia.oncanplay = function() {
-                // Ready to play — reveal video and tear down the other surfaces
-                // in one synchronous turn (no black flash while buffering).
+            function reveal(reason) {
+                if (!video.preloading) return;
+                video.preloading = false;
+                if (video.preloadTimer) { clearInterval(video.preloadTimer); video.preloadTimer = null; }
+                videoMedia.loop = loop;
+                try { videoMedia.currentTime = 0; } catch (e) {}
                 clearSlideshow('video');
                 clearMotion('video');
                 splash.style.display = 'none';
@@ -1070,30 +1086,78 @@
                 videoEl.classList.add('active');
                 video.active = true;
                 var p = videoMedia.play();
-                if (p && p.catch) {
-                    p.catch(function(err) {
-                        tlog('error', 'video play() rejected: ' + err);
-                        broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
-                    });
-                }
-                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
-            };
-            videoMedia.onplaying = function() {
-                tlog('info', 'video playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0));
-                broadcast('videoPlaying', {
-                    url: video.url,
-                    vw: videoMedia.videoWidth || 0,
-                    vh: videoMedia.videoHeight || 0,
-                    ts: Date.now()
+                if (p && p.catch) p.catch(function(err) {
+                    tlog('error', 'video play() rejected: ' + err);
+                    broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
                 });
-            };
+                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
+                broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
+                                            vh: videoMedia.videoHeight || 0, ts: Date.now() });
+                tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
+            }
+
+            function preloadTick() {
+                if (!video.preloading) return;
+                var b = bufferedInfo();
+                var now = Date.now();
+                var elapsed = (now - video.preloadStartAt) / 1000;
+
+                if (b.pct !== lastPct) {
+                    var rate = (b.be - lastBe) / (((now - lastBeAt) / 1000) || 1);   // content-sec cached per wall-sec
+                    broadcast('videoPreload', { pct: b.pct, bufferedSec: +b.be.toFixed(1), durationSec: +b.dur.toFixed(1),
+                                                elapsedSec: +elapsed.toFixed(1), rate: +rate.toFixed(2),
+                                                playhead: +(videoMedia.currentTime || 0).toFixed(1) });
+                    tlog('info', 'preload ' + b.pct + '% (' + b.be.toFixed(0) + '/' + b.dur.toFixed(0) + 's) elapsed=' +
+                                 elapsed.toFixed(0) + 's rate=' + rate.toFixed(1) + 'x realtime, playhead=' +
+                                 (videoMedia.currentTime || 0).toFixed(0) + 's');
+                    lastPct = b.pct; lastBe = b.be; lastBeAt = now;
+                }
+
+                if (b.dur > 0 && b.be >= b.dur - 0.5) {
+                    video.fullyBuffered = true;
+                    broadcast('videoBuffered', { duration: +b.dur.toFixed(2), bufferedSec: +b.be.toFixed(2),
+                                                 pct: 100, elapsedSec: +elapsed.toFixed(1), viaPreload: true });
+                    tlog('info', 'video FULLY buffered via seek-ahead in ' + elapsed.toFixed(1) + 's — safe to close sender');
+                    reveal('fully-buffered');
+                    return;
+                }
+                if (now - video.preloadStartAt > PRELOAD_TIMEOUT_MS) {
+                    broadcast('videoPreloadTimeout', { pct: b.pct, elapsedSec: +elapsed.toFixed(1) });
+                    tlog('error', 'preload TIMEOUT at ' + b.pct + '% after ' + elapsed.toFixed(0) + 's — streaming (NOT fully cached)');
+                    reveal('timeout');
+                    return;
+                }
+
+                // Seek-ahead: pin the playhead just behind the buffered edge so the
+                // media engine keeps pulling forward at full speed.
+                try {
+                    if (b.dur > 0 && b.be > 0.1 && b.be < b.dur - 0.5) {
+                        var target = Math.max(0, b.be - 0.05);
+                        if (Math.abs((videoMedia.currentTime || 0) - target) > 0.1) videoMedia.currentTime = target;
+                    }
+                } catch (e) {}
+            }
+
+            videoMedia.oncanplay = null;
+            videoMedia.onplaying = null;
+            videoMedia.onprogress = preloadTick;
             videoMedia.onerror = function() {
                 var err = videoMedia.error;
                 tlog('error', 'video error code=' + (err && err.code) + ' ' + data.url);
                 broadcast('videoError', { phase: 'load', code: err && err.code, url: data.url });
             };
+
             videoMedia.src = data.url;
             try { videoMedia.load(); } catch (e) {}
+            // Play (muted, hidden) so the engine downloads; seek-ahead races it.
+            var pp = videoMedia.play();
+            if (pp && pp.catch) pp.catch(function(err) { tlog('error', 'preload play() rejected: ' + err); });
+            // Steady driver — `progress` is platform-flaky on TV, so poll too.
+            video.preloadTimer = setInterval(preloadTick, 250);
+
+            tlog('info', 'video preload start (hidden seek-ahead): ' + data.url +
+                         ' loop=' + loop + ' fill=' + (data.fill || 'contain') +
+                         ' timeout=' + (PRELOAD_TIMEOUT_MS / 1000) + 's');
         }
 
         context.addCustomMessageListener(NAMESPACE, function(event) {
