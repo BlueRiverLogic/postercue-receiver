@@ -1241,10 +1241,11 @@
                 blobDecodeSumMs += dt; blobChunksWin++;
                 if (dt > blobDecodeMaxMs) blobDecodeMaxMs = dt;
             }
-            // Ack periodically so the sender's byte-window keeps advancing (this is the
-            // flow control that stops the Cast send buffer overflowing). Every 8 paces a
-            // wide window smoothly while halving reverse-channel traffic.
-            if (blobXfer.received % 8 === 0 || blobXfer.received === blobXfer.total) {
+            // Ack every 2 chunks so the sender's SMALL in-flight window keeps advancing.
+            // The window is now only ~2–4 chunks deep (24 KB each), so an every-8 ack
+            // would starve it into a deadlock. Chunks are big/few now, so every-2 acks are
+            // cheap (~800 for a 37 MB show).
+            if (blobXfer.received % 2 === 0 || blobXfer.received === blobXfer.total) {
                 broadcast('blobAck', { id: blobXfer.id, received: blobXfer.received });
             }
             if (blobXfer.received % 50 === 0 || blobXfer.received === blobXfer.total) {
