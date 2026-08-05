@@ -986,10 +986,22 @@
         // entire show and no longer needs the phone" (safe-to-close) predicate.
         function bufferedInfo() {
             var dur = videoMedia.duration || 0;
-            var be  = (videoMedia.buffered && videoMedia.buffered.length)
-                ? videoMedia.buffered.end(videoMedia.buffered.length - 1) : 0;
+            var tr  = videoMedia.buffered;
+            var n   = (tr && tr.length) ? tr.length : 0;
+            var bs  = n ? tr.start(0) : 0;                 // start of the FIRST range
+            var be  = n ? tr.end(n - 1) : 0;               // end of the LAST range
+            // Total contiguous seconds actually held (sum of all ranges) — the true
+            // "retained" amount. If the file is fully cached this ≈ duration; if the
+            // media engine is EVICTING, `bs` creeps up / `n` grows / held shrinks.
+            var held = 0;
+            for (var i = 0; i < n; i++) held += tr.end(i) - tr.start(i);
             var pct = dur > 0 ? Math.min(100, Math.round(be / dur * 100)) : 0;
-            return { dur: dur, be: be, pct: pct };
+            var heldPct = dur > 0 ? Math.min(100, Math.round(held / dur * 100)) : 0;
+            // Compact ranges string for the log, e.g. "[0-120][300-1000]".
+            var rangesStr = '';
+            for (var j = 0; j < n && j < 6; j++) rangesStr += '[' + tr.start(j).toFixed(0) + '-' + tr.end(j).toFixed(0) + ']';
+            if (n > 6) rangesStr += '…+' + (n - 6);
+            return { dur: dur, be: be, bs: bs, pct: pct, ranges: n, held: held, heldPct: heldPct, rangesStr: rangesStr };
         }
 
         // Fires the one-shot `videoBuffered` event once the entire clip is cached.
@@ -1030,13 +1042,22 @@
         function videoHeartbeat() {
             if (!video.active) return;
             checkVideoBuffered();
+            var b = bufferedInfo();
+            // Eviction truth: `heldPct` is how much is ACTUALLY resident (sum of all
+            // ranges). If it drops below `bufferedPct` (end reached) — or `bufStart`
+            // creeps above 0, or `ranges` > 1 — the engine is evicting cached data,
+            // which means "fully buffered" was a lie and a loop/seek will re-fetch.
             broadcast('videoHeartbeat', {
                 currentTime: +(videoMedia.currentTime || 0).toFixed(2),
                 paused: videoMedia.paused,
                 vw: videoMedia.videoWidth || 0,
                 vh: videoMedia.videoHeight || 0,
                 rot: currentRotation,
-                bufferedPct: bufferedInfo().pct,
+                bufferedPct: b.pct,
+                heldPct: b.heldPct,
+                bufStart: +b.bs.toFixed(1),
+                ranges: b.ranges,
+                rangesStr: b.rangesStr,
                 heap: heapStats()
             });
         }
