@@ -1125,7 +1125,12 @@
         function handleVideoBlobChunk(data) {
             if (!blobXfer || blobXfer.id !== data.id) return;
             if (blobXfer.parts[data.i] === undefined) { blobXfer.parts[data.i] = data.d; blobXfer.received++; }
-            if (blobXfer.received % 100 === 0 || blobXfer.received === blobXfer.total) {
+            // Ack often so the sender's small in-flight window keeps advancing —
+            // this is the flow control that stops the Cast send buffer overflowing.
+            if (blobXfer.received % 2 === 0 || blobXfer.received === blobXfer.total) {
+                broadcast('blobAck', { id: blobXfer.id, received: blobXfer.received });
+            }
+            if (blobXfer.received % 50 === 0 || blobXfer.received === blobXfer.total) {
                 var pct = blobXfer.total ? Math.round(blobXfer.received / blobXfer.total * 100) : 0;
                 broadcast('videoBlobProgress', { received: blobXfer.received, total: blobXfer.total, pct: pct });
             }
