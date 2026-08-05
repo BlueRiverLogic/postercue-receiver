@@ -979,7 +979,7 @@
         var videoMedia = document.getElementById('video-el');    // the <video> element
 
         var video = { active: false, url: null, heartbeat: null, fullyBuffered: false,
-                      preloading: false, preloadTimer: null, preloadStartAt: 0 };
+                      preloading: false, preloadTimer: null, preloadStartAt: 0, resumeTimer: null };
 
         // How much of the clip the media element has cached from the start, and
         // whether the WHOLE file is buffered — the true "the receiver has the
@@ -1031,9 +1031,11 @@
             if (!video.active && !video.url) return;
             if (video.heartbeat) { clearInterval(video.heartbeat); video.heartbeat = null; }
             if (video.preloadTimer) { clearInterval(video.preloadTimer); video.preloadTimer = null; }
+            if (video.resumeTimer) { clearInterval(video.resumeTimer); video.resumeTimer = null; }
             video.preloading = false;
             videoMedia.oncanplay = null; videoMedia.onplaying = null; videoMedia.onerror = null;
-            videoMedia.onprogress = null;
+            videoMedia.onprogress = null; videoMedia.onpause = null; videoMedia.onplay = null;
+            videoMedia.onwaiting = null; videoMedia.onstalled = null; videoMedia.onended = null;
             video.fullyBuffered = false;
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.removeAttribute('src');
@@ -1120,6 +1122,47 @@
                     broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
                 });
                 if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
+
+                // A loop slideshow must NEVER sit paused. If it pauses itself (decode
+                // hiccup, brief page-hide, TV standby blip), log WHY and keep retrying
+                // play() until it resumes. This is the self-heal for the "stuck on an
+                // image" freeze — the file is fully cached (held=100%), it just stopped.
+                videoMedia.onpause = function() {
+                    if (!video.active || video.preloading) return;
+                    var err = videoMedia.error;
+                    broadcast('videoEvent', { evt: 'pause', ct: +(videoMedia.currentTime || 0).toFixed(2),
+                                              readyState: videoMedia.readyState, networkState: videoMedia.networkState,
+                                              hidden: document.hidden, err: (err && err.code) || 0,
+                                              heldPct: bufferedInfo().heldPct });
+                    tlog('error', 'video PAUSED unexpectedly ct=' + (videoMedia.currentTime || 0).toFixed(2) +
+                                 ' readyState=' + videoMedia.readyState + ' netState=' + videoMedia.networkState +
+                                 ' hidden=' + document.hidden + ' err=' + ((err && err.code) || 0) + ' — auto-resuming');
+                    if (!video.resumeTimer) {
+                        video.resumeTimer = setInterval(function() {
+                            if (!video.active || !videoMedia.paused) { clearInterval(video.resumeTimer); video.resumeTimer = null; return; }
+                            var p = videoMedia.play();
+                            if (p && p.catch) p.catch(function() {});
+                        }, 1000);
+                    }
+                };
+                videoMedia.onplay = function() {
+                    if (video.resumeTimer) { clearInterval(video.resumeTimer); video.resumeTimer = null;
+                        tlog('info', 'video resumed ct=' + (videoMedia.currentTime || 0).toFixed(2)); }
+                };
+                videoMedia.onwaiting = function() {
+                    if (video.active && !video.preloading)
+                        tlog('info', 'video WAITING (decode/buffer stall) ct=' + (videoMedia.currentTime || 0).toFixed(2) +
+                                     ' readyState=' + videoMedia.readyState + ' held=' + bufferedInfo().heldPct + '%');
+                };
+                videoMedia.onstalled = function() {
+                    if (video.active && !video.preloading)
+                        tlog('info', 'video STALLED ct=' + (videoMedia.currentTime || 0).toFixed(2) + ' netState=' + videoMedia.networkState);
+                };
+                videoMedia.onended = function() {
+                    // loop=true means this shouldn't fire; if it does, restart.
+                    if (video.active) { tlog('error', 'video ENDED (loop failed) — restarting'); try { videoMedia.currentTime = 0; videoMedia.play(); } catch (e) {} }
+                };
+
                 broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
                                             vh: videoMedia.videoHeight || 0, ts: Date.now() });
                 tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
