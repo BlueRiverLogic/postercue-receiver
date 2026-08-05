@@ -1072,6 +1072,122 @@
             });
         }
 
+        // Keep a looping video self-healing: if it pauses itself (decode hiccup,
+        // brief page-hide, standby blip) auto-resume; log waits/stalls. Shared by
+        // the streaming reveal and the blob playback path.
+        function attachVideoResilience() {
+            videoMedia.onpause = function() {
+                if (!video.active || video.preloading) return;
+                var err = videoMedia.error;
+                broadcast('videoEvent', { evt: 'pause', ct: +(videoMedia.currentTime || 0).toFixed(2),
+                                          readyState: videoMedia.readyState, networkState: videoMedia.networkState,
+                                          hidden: document.hidden, err: (err && err.code) || 0 });
+                tlog('error', 'video PAUSED unexpectedly ct=' + (videoMedia.currentTime || 0).toFixed(2) +
+                             ' readyState=' + videoMedia.readyState + ' netState=' + videoMedia.networkState +
+                             ' hidden=' + document.hidden + ' err=' + ((err && err.code) || 0) + ' — auto-resuming');
+                if (!video.resumeTimer) {
+                    video.resumeTimer = setInterval(function() {
+                        if (!video.active || !videoMedia.paused) { clearInterval(video.resumeTimer); video.resumeTimer = null; return; }
+                        var p = videoMedia.play(); if (p && p.catch) p.catch(function() {});
+                    }, 1000);
+                }
+            };
+            videoMedia.onplay = function() {
+                if (video.resumeTimer) { clearInterval(video.resumeTimer); video.resumeTimer = null;
+                    tlog('info', 'video resumed ct=' + (videoMedia.currentTime || 0).toFixed(2)); }
+            };
+            videoMedia.onwaiting = function() {
+                if (video.active && !video.preloading)
+                    tlog('info', 'video WAITING ct=' + (videoMedia.currentTime || 0).toFixed(2) + ' readyState=' + videoMedia.readyState);
+            };
+            videoMedia.onstalled = function() {
+                if (video.active && !video.preloading)
+                    tlog('info', 'video STALLED ct=' + (videoMedia.currentTime || 0).toFixed(2) + ' netState=' + videoMedia.networkState);
+            };
+            videoMedia.onended = function() {
+                if (video.active) { tlog('error', 'video ENDED (loop failed) — restarting'); try { videoMedia.currentTime = 0; videoMedia.play(); } catch (e) {} }
+            };
+        }
+
+        // ── BLOB transfer: reassemble an MP4 streamed over the message channel ──
+        // The bytes arrive as chunked base64 (64 KB/message cap), get concatenated,
+        // decoded to a Uint8Array → Blob → object URL, and played from RAM. Because
+        // the whole file lives in receiver memory, playback SURVIVES the sender/app
+        // (and its HTTP server) going away — the real "close the app" autonomy.
+        var blobXfer = null;   // { id, total, bytes, parts[], received, fill, loop, startAt }
+
+        function handleVideoBlobBegin(data) {
+            blobXfer = { id: data.id, total: data.chunks || 0, bytes: data.bytes || 0,
+                         parts: new Array(data.chunks || 0), received: 0,
+                         fill: data.fill || 'cover', loop: data.loop !== false, startAt: Date.now() };
+            tlog('info', 'blob begin id=' + data.id + ' chunks=' + data.chunks + ' bytes=' + data.bytes);
+        }
+        function handleVideoBlobChunk(data) {
+            if (!blobXfer || blobXfer.id !== data.id) return;
+            if (blobXfer.parts[data.i] === undefined) { blobXfer.parts[data.i] = data.d; blobXfer.received++; }
+            if (blobXfer.received % 100 === 0 || blobXfer.received === blobXfer.total) {
+                var pct = blobXfer.total ? Math.round(blobXfer.received / blobXfer.total * 100) : 0;
+                broadcast('videoBlobProgress', { received: blobXfer.received, total: blobXfer.total, pct: pct });
+            }
+        }
+        function handleVideoBlobEnd(data) {
+            if (!blobXfer || blobXfer.id !== data.id) { tlog('error', 'blob end for unknown id ' + (data && data.id)); return; }
+            var missing = 0;
+            for (var k = 0; k < blobXfer.total; k++) if (blobXfer.parts[k] === undefined) missing++;
+            if (missing > 0) {
+                tlog('error', 'blob INCOMPLETE — missing ' + missing + '/' + blobXfer.total + ' chunks');
+                broadcast('videoBlobError', { message: 'incomplete', missing: missing });
+                blobXfer = null; return;
+            }
+            var b64 = blobXfer.parts.join('');
+            var bin;
+            try { bin = atob(b64); } catch (e) { tlog('error', 'blob atob failed: ' + e); broadcast('videoBlobError', { message: 'decode' }); blobXfer = null; return; }
+            var len = bin.length, bytes = new Uint8Array(len);
+            for (var j = 0; j < len; j++) bytes[j] = bin.charCodeAt(j);
+            var blob = new Blob([bytes], { type: 'video/mp4' });
+            var url = URL.createObjectURL(blob);
+            var elapsed = (Date.now() - blobXfer.startAt) / 1000;
+            tlog('info', 'blob COMPLETE ' + len + ' bytes in ' + elapsed.toFixed(1) + 's — playing from RAM (source-independent)');
+            broadcast('videoBlobReady', { bytes: len, elapsedSec: +elapsed.toFixed(1) });
+            playBlobVideo(url, blobXfer.fill, blobXfer.loop);
+            blobXfer = null;
+        }
+
+        // Play a fully-in-memory blob: URL. No preload/seek-ahead needed — the bytes
+        // are already resident, so we reveal + loop immediately with the same
+        // self-healing resilience as the streaming path.
+        function playBlobVideo(blobUrl, fill, loop) {
+            clearVideo('blob-restart');
+            video.url = blobUrl;
+            video.fullyBuffered = true;
+            video.preloading = false;
+            videoMedia.loop = loop;
+            videoMedia.muted = true;
+            videoMedia.style.objectFit = (fill === 'cover') ? 'cover' : 'contain';
+            styleRotation(videoEl, 0);
+            videoMedia.oncanplay = function() {
+                clearSlideshow('blob-video');
+                clearMotion('blob-video');
+                splash.style.display = 'none';
+                canvas.style.display = 'none';
+                videoEl.classList.add('active');
+                video.active = true;
+                var p = videoMedia.play();
+                if (p && p.catch) p.catch(function(err) { broadcast('videoError', { phase: 'play', message: String(err) }); });
+                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
+                attachVideoResilience();
+                broadcast('videoPlaying', { url: 'blob', vw: videoMedia.videoWidth || 0, vh: videoMedia.videoHeight || 0, ts: Date.now() });
+                tlog('info', 'blob video playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0));
+            };
+            videoMedia.onerror = function() {
+                var err = videoMedia.error;
+                tlog('error', 'blob video error code=' + (err && err.code));
+                broadcast('videoError', { phase: 'load', code: err && err.code, url: 'blob' });
+            };
+            videoMedia.src = blobUrl;
+            try { videoMedia.load(); } catch (e) {}
+        }
+
         // Build & start a video from { url, loop, fill }.
         //
         // FORCE-DOWNLOAD PRELOAD: the HTML5 <video> progressive loader throttles a
@@ -1122,47 +1238,7 @@
                     broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
                 });
                 if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
-
-                // A loop slideshow must NEVER sit paused. If it pauses itself (decode
-                // hiccup, brief page-hide, TV standby blip), log WHY and keep retrying
-                // play() until it resumes. This is the self-heal for the "stuck on an
-                // image" freeze — the file is fully cached (held=100%), it just stopped.
-                videoMedia.onpause = function() {
-                    if (!video.active || video.preloading) return;
-                    var err = videoMedia.error;
-                    broadcast('videoEvent', { evt: 'pause', ct: +(videoMedia.currentTime || 0).toFixed(2),
-                                              readyState: videoMedia.readyState, networkState: videoMedia.networkState,
-                                              hidden: document.hidden, err: (err && err.code) || 0,
-                                              heldPct: bufferedInfo().heldPct });
-                    tlog('error', 'video PAUSED unexpectedly ct=' + (videoMedia.currentTime || 0).toFixed(2) +
-                                 ' readyState=' + videoMedia.readyState + ' netState=' + videoMedia.networkState +
-                                 ' hidden=' + document.hidden + ' err=' + ((err && err.code) || 0) + ' — auto-resuming');
-                    if (!video.resumeTimer) {
-                        video.resumeTimer = setInterval(function() {
-                            if (!video.active || !videoMedia.paused) { clearInterval(video.resumeTimer); video.resumeTimer = null; return; }
-                            var p = videoMedia.play();
-                            if (p && p.catch) p.catch(function() {});
-                        }, 1000);
-                    }
-                };
-                videoMedia.onplay = function() {
-                    if (video.resumeTimer) { clearInterval(video.resumeTimer); video.resumeTimer = null;
-                        tlog('info', 'video resumed ct=' + (videoMedia.currentTime || 0).toFixed(2)); }
-                };
-                videoMedia.onwaiting = function() {
-                    if (video.active && !video.preloading)
-                        tlog('info', 'video WAITING (decode/buffer stall) ct=' + (videoMedia.currentTime || 0).toFixed(2) +
-                                     ' readyState=' + videoMedia.readyState + ' held=' + bufferedInfo().heldPct + '%');
-                };
-                videoMedia.onstalled = function() {
-                    if (video.active && !video.preloading)
-                        tlog('info', 'video STALLED ct=' + (videoMedia.currentTime || 0).toFixed(2) + ' netState=' + videoMedia.networkState);
-                };
-                videoMedia.onended = function() {
-                    // loop=true means this shouldn't fire; if it does, restart.
-                    if (video.active) { tlog('error', 'video ENDED (loop failed) — restarting'); try { videoMedia.currentTime = 0; videoMedia.play(); } catch (e) {} }
-                };
-
+                attachVideoResilience();
                 broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
                                             vh: videoMedia.videoHeight || 0, ts: Date.now() });
                 tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
@@ -1313,6 +1389,10 @@
                     processingMs: Date.now() - receivedAt
                 });
             }
+
+            else if (data.action === 'videoBlobBegin') { handleVideoBlobBegin(data); }
+            else if (data.action === 'videoBlobChunk') { handleVideoBlobChunk(data); }
+            else if (data.action === 'videoBlobEnd')   { handleVideoBlobEnd(data); }
 
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
