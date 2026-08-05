@@ -1110,11 +1110,12 @@
         }
 
         // ── BLOB transfer: reassemble an MP4 streamed over the message channel ──
-        // The bytes arrive as chunked base64 (64 KB/message cap), get concatenated,
-        // decoded to a Uint8Array → Blob → object URL, and played from RAM. Because
-        // the whole file lives in receiver memory, playback SURVIVES the sender/app
-        // (and its HTTP server) going away — the real "close the app" autonomy.
-        var blobXfer = null;   // { id, total, bytes, parts[], received, fill, loop, startAt }
+        // Each chunk (self-contained base64, sender uses a multiple-of-3 raw size) is
+        // decoded to a Uint8Array AS IT ARRIVES and the base64 string freed, so we
+        // never hold the giant joined-base64 string or a big atob() output — peak
+        // memory ≈ the file itself, not ~3× it. The whole file lives in receiver RAM,
+        // so playback SURVIVES the sender/app (and its HTTP server) going away.
+        var blobXfer = null;   // { id, total, bytes, parts[](Uint8Array), received, fill, loop, startAt }
 
         function handleVideoBlobBegin(data) {
             blobXfer = { id: data.id, total: data.chunks || 0, bytes: data.bytes || 0,
@@ -1124,7 +1125,15 @@
         }
         function handleVideoBlobChunk(data) {
             if (!blobXfer || blobXfer.id !== data.id) return;
-            if (blobXfer.parts[data.i] === undefined) { blobXfer.parts[data.i] = data.d; blobXfer.received++; }
+            if (blobXfer.parts[data.i] === undefined) {
+                try {
+                    var bin = atob(data.d);
+                    var u = new Uint8Array(bin.length);
+                    for (var k = 0; k < bin.length; k++) u[k] = bin.charCodeAt(k);
+                    blobXfer.parts[data.i] = u;              // hold the DECODED bytes; base64 string is now free
+                    blobXfer.received++;
+                } catch (e) { tlog('error', 'blob chunk decode failed i=' + data.i + ': ' + e); }
+            }
             // Ack often so the sender's small in-flight window keeps advancing —
             // this is the flow control that stops the Cast send buffer overflowing.
             if (blobXfer.received % 4 === 0 || blobXfer.received === blobXfer.total) {
@@ -1137,19 +1146,17 @@
         }
         function handleVideoBlobEnd(data) {
             if (!blobXfer || blobXfer.id !== data.id) { tlog('error', 'blob end for unknown id ' + (data && data.id)); return; }
-            var missing = 0;
-            for (var k = 0; k < blobXfer.total; k++) if (blobXfer.parts[k] === undefined) missing++;
+            var missing = 0, len = 0;
+            for (var k = 0; k < blobXfer.total; k++) {
+                if (blobXfer.parts[k] === undefined) missing++; else len += blobXfer.parts[k].length;
+            }
             if (missing > 0) {
                 tlog('error', 'blob INCOMPLETE — missing ' + missing + '/' + blobXfer.total + ' chunks');
                 broadcast('videoBlobError', { message: 'incomplete', missing: missing });
                 blobXfer = null; return;
             }
-            var b64 = blobXfer.parts.join('');
-            var bin;
-            try { bin = atob(b64); } catch (e) { tlog('error', 'blob atob failed: ' + e); broadcast('videoBlobError', { message: 'decode' }); blobXfer = null; return; }
-            var len = bin.length, bytes = new Uint8Array(len);
-            for (var j = 0; j < len; j++) bytes[j] = bin.charCodeAt(j);
-            var blob = new Blob([bytes], { type: 'video/mp4' });
+            // Blob accepts the array of Uint8Array parts directly — no concatenation.
+            var blob = new Blob(blobXfer.parts, { type: 'video/mp4' });
             var url = URL.createObjectURL(blob);
             var elapsed = (Date.now() - blobXfer.startAt) / 1000;
             tlog('info', 'blob COMPLETE ' + len + ' bytes in ' + elapsed.toFixed(1) + 's — playing from RAM (source-independent)');
