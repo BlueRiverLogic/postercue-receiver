@@ -52,15 +52,18 @@ echo "🚀 Pushed ${STAMP} — GitHub Actions is publishing; verifying the live 
 # CDN can take ~30-120s). This is the safeguard against the silent-stale-deploy
 # failure: if this loop times out, the deploy did NOT publish — check the
 # Actions run (`gh run list --workflow=pages.yml`) and Pages status.
+# NOTE: the Actions deploy job on this repo's runners takes ~9-10 min end to
+# end (build + CDN), so poll patiently up to ~15 min before declaring failure.
 URL="https://blueriverlogic.github.io/postercue-receiver/index.html"
-for i in $(seq 1 30); do
-  sleep 6
+for i in $(seq 1 90); do
+  sleep 10
   if curl -fsS "${URL}?cb=$(date +%s%N)" -m 20 2>/dev/null | grep -q "var RECEIVER_BUILD = '${STAMP}';"; then
-    echo "✅ Origin confirmed live: ${STAMP} (after ~$((i*6))s)"
+    echo "✅ Origin confirmed live: ${STAMP} (after ~$((i*10))s)"
     echo "   Now reboot/reconnect the Cast device and check the app log shows build=${STAMP}."
     exit 0
   fi
+  [ $((i % 6)) -eq 0 ] && echo "   …still publishing ($((i*10))s; Actions runs take ~9-10 min here)"
 done
-echo "❌ Origin did NOT serve ${STAMP} within ~180s — publish likely failed." >&2
+echo "❌ Origin did NOT serve ${STAMP} within ~15 min — publish likely failed." >&2
 echo "   Check: gh run list --workflow=pages.yml   and   gh api repos/BlueRiverLogic/postercue-receiver/pages" >&2
 exit 1
