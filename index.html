@@ -1567,13 +1567,34 @@
 
             videoMedia.oncanplay = null;
             videoMedia.onplaying = null;
-            videoMedia.onprogress = preloadTick;
             videoMedia.onerror = function() {
                 var err = videoMedia.error;
                 tlog('error', 'video error code=' + (err && err.code) + ' ' + data.url);
                 broadcast('videoError', { phase: 'load', code: err && err.code, url: data.url });
             };
 
+            // FAST PATH — small single-poster clips (gated still→video carry an
+            // `imageUrl`). These are ~2s, fully-cached-in-one-GET clips, so the
+            // heavy seek-ahead preload (built to force-download large multi-image
+            // slideshow blobs) is pure latency here. Reveal as soon as the first
+            // frame is decodable (`canplay`), which gets the new poster on screen
+            // ~0.5s sooner. The bridge cover still holds until the video actually
+            // paints (reveal → onFirstVideoFrame), so this only trims wait, it
+            // doesn't reintroduce a gap. Slideshow/test videos (no imageUrl) keep
+            // the full seek-ahead preload below.
+            if (data.imageUrl) {
+                videoMedia.onprogress = null;
+                videoMedia.oncanplay = function () { reveal('fast-canplay'); };
+                videoMedia.src = data.url;
+                try { videoMedia.load(); } catch (e) {}
+                var pf = videoMedia.play();
+                if (pf && pf.catch) pf.catch(function(err) { tlog('error', 'fast play() rejected: ' + err); });
+                tlog('info', 'video fast start (single poster, reveal on canplay): ' + data.url +
+                             ' loop=' + loop + ' fill=' + (data.fill || 'contain'));
+                return;
+            }
+
+            videoMedia.onprogress = preloadTick;
             videoMedia.src = data.url;
             try { videoMedia.load(); } catch (e) {}
             // Play (muted, hidden) so the engine downloads; seek-ahead races it.
