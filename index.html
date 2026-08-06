@@ -123,6 +123,21 @@
             width: 100%; height: 100%;
             object-fit: contain; background: #000;
         }
+
+        /* ── Poster cover (still→video bridge) ───────────────────────────
+           Top-most layer. For a gated still→video swap the sender includes the
+           poster as `imageUrl`; we raise this cover FIRST, then warm up + play
+           the <video> HIDDEN BEHIND it, and drop the cover only once the video
+           has presented a real frame (requestVideoFrameCallback). Revealing the
+           video by REMOVING the cover — never by stacking the video on top — is
+           what avoids the black warmup frame. Structured like #canvas so
+           portrait posters rotate upright identically. */
+        #bridge {
+            position: absolute; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            display: none; z-index: 11; background: #000;
+        }
+        #bridge.active { display: block; }
     </style>
 </head>
 <body>
@@ -162,6 +177,10 @@
     <div id="video">
         <video id="video-el" muted loop autoplay playsinline preload="auto"></video>
     </div>
+
+    <!-- Poster cover for the still→video bridge (see #bridge CSS). Sits above
+         everything; the video is revealed by hiding this, not by stacking on top. -->
+    <div id="bridge"><img id="bridge-img" class="layer active"></div>
 
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <script>
@@ -329,6 +348,7 @@
             clearMotion('splash');
             clearSlideshow('splash');
             clearVideo('splash');
+            hideBridgeCover();
             styleRotation(splash, currentRotation);
             splash.style.display = 'flex';
             canvas.style.display = 'none';
@@ -508,6 +528,7 @@
             clearSlideshow('restart');               // tear down any prior show first
             clearMotion('slideshow');                // and any running motion poster
             clearVideo('slideshow');                 // …and any playing video
+            hideBridgeCover();
 
             // Hide the single-image layers; the slideshow uses its own layers
             // inside the same #canvas, so it inherits orientation/rotation.
@@ -960,6 +981,7 @@
                 // stayed visible instead of a black flash).
                 clearSlideshow('motion');            // motion supersedes any slideshow
                 clearVideo('motion');                // …and any playing video
+                hideBridgeCover();
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 motionEl.classList.add('active');
@@ -1004,7 +1026,8 @@
         var videoMedia = document.getElementById('video-el');    // the <video> element
 
         var video = { active: false, url: null, heartbeat: null, fullyBuffered: false,
-                      preloading: false, preloadTimer: null, preloadStartAt: 0, resumeTimer: null };
+                      preloading: false, preloadTimer: null, preloadStartAt: 0, resumeTimer: null,
+                      bridged: false };
 
         // ── Poster-image bridge for still→video swaps ────────────────────
         // A gated single poster is delivered as a looping video (to defeat the TV
@@ -1025,6 +1048,7 @@
                 clearSlideshow('single-image');
                 clearMotion('single-image');
                 clearVideo('single-image');
+                hideBridgeCover();
                 splash.style.display = 'none';
                 canvas.style.display = 'block';
                 activeImg.classList.remove('active');
@@ -1040,6 +1064,53 @@
                 if (onShown) onShown();   // proceed to the video even if the bridge image failed
             };
             standbyImg.src = url;
+        }
+
+        // ── Poster cover for still→video swaps (see #bridge) ─────────────
+        var bridgeCover    = document.getElementById('bridge');
+        var bridgeCoverImg = document.getElementById('bridge-img');
+
+        // Raise the poster cover ON TOP of everything, then call onReady once the
+        // poster has DECODED (so the cover paints a real image, not a blank box).
+        function showBridgeCover(url, onReady) {
+            bridgeCoverImg.onload = function() {
+                styleRotation(bridgeCover, currentRotation);   // portrait upright, mirrors #canvas
+                bridgeCover.classList.add('active');
+                tlog('verbose', 'bridge cover up');
+                if (onReady) onReady();
+            };
+            bridgeCoverImg.onerror = function() {
+                tlog('error', 'bridge cover image failed: ' + url);
+                if (onReady) onReady();   // start the video anyway rather than stall
+            };
+            bridgeCoverImg.src = url;
+        }
+
+        function hideBridgeCover() {
+            if (bridgeCover.classList.contains('active')) {
+                bridgeCover.classList.remove('active');
+                tlog('verbose', 'bridge cover dropped');
+            }
+        }
+
+        // Fire cb once the <video> has PRESENTED a real frame to the compositor —
+        // the only safe moment to drop the cover. requestVideoFrameCallback is the
+        // ground truth; fall back to timeupdate + a compositor tick where it's
+        // unavailable. If the video never paints (wedge), cb never fires and the
+        // cover stays up (poster held, never black) — exactly what we want.
+        function onFirstVideoFrame(cb) {
+            var fired = false;
+            var go = function() { if (fired) return; fired = true; cb(); };
+            if (typeof videoMedia.requestVideoFrameCallback === 'function') {
+                videoMedia.requestVideoFrameCallback(function() { go(); });
+            } else {
+                var on = function() {
+                    if ((videoMedia.currentTime || 0) <= 0) return;
+                    videoMedia.removeEventListener('timeupdate', on);
+                    requestAnimationFrame(function() { requestAnimationFrame(go); });
+                };
+                videoMedia.addEventListener('timeupdate', on);
+            }
         }
 
         // How much of the clip the media element has cached from the start, and
@@ -1331,6 +1402,7 @@
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 videoEl.classList.add('active');
+                hideBridgeCover();
                 video.active = true;
                 var p = videoMedia.play();
                 if (p && p.catch) p.catch(function(err) { broadcast('videoError', { phase: 'play', message: String(err) }); });
@@ -1389,36 +1461,39 @@
                 if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
                 attachVideoResilience();
 
-                // "Show new, then pull old": keep the current surface (the poster
-                // image bridge, or whatever's on screen) UP until the video is
-                // genuinely painting a decoded frame — the first timeupdate after
-                // seeking to 0 — then reveal the video and drop the old surface in
-                // the SAME turn. Revealing a not-yet-painted <video> shows its black
-                // background — exactly the flash we're killing — so we NEVER reveal
-                // on a timer. If the video never plays, the poster simply stays up
-                // (no black); the sender's in-flight guard + heartbeat cover that.
-                var swappedIn = false;
-                var swapIn = function () {
-                    if (swappedIn) return;
-                    swappedIn = true;
-                    videoMedia.removeEventListener('timeupdate', swapIn);
-                    clearSlideshow('video');
-                    clearMotion('video');
-                    videoEl.classList.add('active');   // new video paints its decoded frame…
-                    splash.style.display = 'none';
-                    canvas.style.display = 'none';     // …as the bridge image is removed — same turn
-                    video.active = true;
-                    broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
-                                                vh: videoMedia.videoHeight || 0, ts: Date.now() });
-                    tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
-                };
-                videoMedia.addEventListener('timeupdate', swapIn);
+                // Make the video live NOW. Tear down the other graphics surfaces
+                // (slideshow/motion/splash/canvas image) — but when a poster COVER
+                // is up (gated still→video), it sits ON TOP (z-index 11) and hides
+                // the <video>'s display→paint warmup, so none of this shows. We then
+                // drop the cover only once the video has PRESENTED a real frame
+                // ("show new, then pull old"). Revealing the video by removing the
+                // cover — never by stacking a not-yet-painted (black) <video> on top
+                // of the poster — is what finally kills the black flash. If the
+                // video never paints (wedge), the cover stays up: poster held, never
+                // black. Without a cover (test/motion clips) reveal directly.
+                clearSlideshow('video');
+                clearMotion('video');
+                videoEl.classList.add('active');
+                splash.style.display = 'none';
+                canvas.style.display = 'none';
+                video.active = true;
 
                 var p = videoMedia.play();
                 if (p && p.catch) p.catch(function(err) {
                     tlog('error', 'video play() rejected: ' + err);
                     broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
                 });
+
+                var announce = function () {
+                    broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
+                                                vh: videoMedia.videoHeight || 0, ts: Date.now() });
+                    tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
+                };
+                if (video.bridged && bridgeCover.classList.contains('active')) {
+                    onFirstVideoFrame(function () { hideBridgeCover(); announce(); });
+                } else {
+                    announce();
+                }
             }
 
             function preloadTick() {
@@ -1526,14 +1601,15 @@
                 // Real video on the hardware video plane (4K-capable, screensaver-
                 // suppressing). Supersedes any image / slideshow / motion poster.
                 //
-                // With an `imageUrl` (gated still→video) bridge the swap: show the
-                // poster FIRST via the gapless <img> path, then startVideo reveals
-                // the video on its first painted frame and drops the image — no
-                // black flash, single decoder. Without one (test/motion clips)
-                // start the video directly (may briefly show the splash).
+                // With an `imageUrl` (gated still→video) bridge the swap: raise the
+                // poster COVER on top, then start the video HIDDEN behind it and drop
+                // the cover only once it's actually painting (see reveal). No black
+                // flash, single decoder. Without one (test/motion clips) start direct.
                 if (data.imageUrl) {
-                    showPosterImage(data.imageUrl, null, receivedAt, function () { startVideo(data); });
+                    video.bridged = true;
+                    showBridgeCover(data.imageUrl, function () { startVideo(data); });
                 } else {
+                    video.bridged = false;
                     startVideo(data);
                 }
                 sendMessage(event.senderId, {
