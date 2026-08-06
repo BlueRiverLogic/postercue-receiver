@@ -123,21 +123,6 @@
             width: 100%; height: 100%;
             object-fit: contain; background: #000;
         }
-
-        /* ── Video freeze-frame bridge ───────────────────────────────────
-           A snapshot of the OUTGOING video's last frame, painted on top while
-           the next video preloads, so a video→video swap never flashes black
-           (see showBridge()/hideBridge()). Top-most (above the video plane).
-           NOT rotated — the captured pixels are already the pre-rotated
-           landscape frame, and the Cast plane is always 1920×1080, so filling
-           the viewport reproduces the video's own `contain` framing exactly. */
-        #video-bridge {
-            position: absolute; top: 0; left: 0;
-            width: 100vw; height: 100vh;
-            display: none; z-index: 9; background: #000;
-            will-change: transform; backface-visibility: hidden;
-        }
-        #video-bridge.active { display: block; }
     </style>
 </head>
 <body>
@@ -177,11 +162,6 @@
     <div id="video">
         <video id="video-el" muted loop autoplay playsinline preload="auto"></video>
     </div>
-
-    <!-- Video freeze-frame bridge: holds the outgoing video's last frame on top
-         while the next video preloads, so a video→video swap is gapless (the
-         double-buffer equivalent of the <img> layers). -->
-    <canvas id="video-bridge"></canvas>
 
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <script>
@@ -349,7 +329,6 @@
             clearMotion('splash');
             clearSlideshow('splash');
             clearVideo('splash');
-            hideBridge();
             styleRotation(splash, currentRotation);
             splash.style.display = 'flex';
             canvas.style.display = 'none';
@@ -529,7 +508,6 @@
             clearSlideshow('restart');               // tear down any prior show first
             clearMotion('slideshow');                // and any running motion poster
             clearVideo('slideshow');                 // …and any playing video
-            hideBridge();
 
             // Hide the single-image layers; the slideshow uses its own layers
             // inside the same #canvas, so it inherits orientation/rotation.
@@ -982,7 +960,6 @@
                 // stayed visible instead of a black flash).
                 clearSlideshow('motion');            // motion supersedes any slideshow
                 clearVideo('motion');                // …and any playing video
-                hideBridge();
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 motionEl.classList.add('active');
@@ -1029,45 +1006,40 @@
         var video = { active: false, url: null, heartbeat: null, fullyBuffered: false,
                       preloading: false, preloadTimer: null, preloadStartAt: 0, resumeTimer: null };
 
-        // ── Video freeze-frame bridge ────────────────────────────────────
-        // A video→video swap must tear down the single <video> before the new
-        // src can load, exposing whatever is behind it (the splash) for the
-        // preload window — usually a blink, but up to tens of seconds if a weak
-        // receiver's media element wedges on the new load (observed: a 32s stall
-        // on an LG built-in Cast → a 32s black screen). To stay gapless — the
-        // same guarantee the double-buffered <img> path gives — we paint the
-        // OUTGOING frame onto this top-most canvas and hold it until the new
-        // video actually paints. The old poster simply lingers a beat longer
-        // instead of ever going black; if the new load wedges outright, the old
-        // frame stays up rather than blanking.
+        // ── Poster-image bridge for still→video swaps ────────────────────
+        // A gated single poster is delivered as a looping video (to defeat the TV
+        // screensaver). Swapping the <video> src tears the old video down before
+        // the new one can paint, which flashes black — and a canvas snapshot of a
+        // hardware-plane <video> just draws black on these TVs, so that can't
+        // bridge it. Instead the sender includes the poster as an `imageUrl`: we
+        // show that poster FIRST via the gapless double-buffered <img> path, then
+        // reveal the matching video on top only once it's actually painting (see
+        // startVideo/reveal), hiding the image in the same turn — "show new, then
+        // pull old." Only one video ever decodes at a time, so no dual-decoder risk.
         //
-        // The receiver page and the LAN video are different origins, so
-        // drawImage() TAINTS this canvas — which is fine: we only DISPLAY it,
-        // never read pixels back (getImageData/toDataURL would throw; drawImage
-        // itself succeeds and the tainted canvas still renders).
-        var videoBridge = document.getElementById('video-bridge');
-        var bridgeCtx   = videoBridge.getContext('2d');
-
-        function showBridge() {
-            // Only meaningful when there's a decoded video frame to freeze.
-            if (!videoMedia.videoWidth || !videoMedia.videoHeight) return;
-            try {
-                videoBridge.width  = videoMedia.videoWidth;    // match the pre-rotated landscape pixels
-                videoBridge.height = videoMedia.videoHeight;
-                bridgeCtx.drawImage(videoMedia, 0, 0, videoBridge.width, videoBridge.height);
-                videoBridge.classList.add('active');
-                tlog('verbose', 'video bridge: froze ' + videoBridge.width + 'x' + videoBridge.height + ' — holding during swap');
-            } catch (e) {
-                // Degrade to the old behaviour (brief gap) rather than fail the swap.
-                tlog('error', 'video bridge capture failed: ' + e);
-            }
-        }
-
-        function hideBridge() {
-            if (videoBridge.classList.contains('active')) {
-                videoBridge.classList.remove('active');
-                tlog('verbose', 'video bridge: released');
-            }
+        // showPosterImage() is the shared <img> double-buffer used by BOTH the
+        // plain `show` action and this bridge: load into the standby layer, then
+        // swap it in atomically on decode so the previous surface never blanks.
+        function showPosterImage(url, senderId, receivedAt, onShown) {
+            standbyImg.onload = function() {
+                clearSlideshow('single-image');
+                clearMotion('single-image');
+                clearVideo('single-image');
+                splash.style.display = 'none';
+                canvas.style.display = 'block';
+                activeImg.classList.remove('active');
+                standbyImg.classList.add('active');
+                var tmp = activeImg; activeImg = standbyImg; standbyImg = tmp;
+                if (senderId) sendMessage(senderId, { event: 'imageDisplayed', url: url,
+                                                      ts: Date.now(), processingMs: Date.now() - (receivedAt || Date.now()) });
+                if (onShown) onShown();
+            };
+            standbyImg.onerror = function() {
+                if (senderId) sendMessage(senderId, { event: 'error', message: 'Failed to load image', url: url,
+                                                      ts: Date.now(), processingMs: Date.now() - (receivedAt || Date.now()) });
+                if (onShown) onShown();   // proceed to the video even if the bridge image failed
+            };
+            standbyImg.src = url;
         }
 
         // How much of the clip the media element has cached from the start, and
@@ -1359,7 +1331,6 @@
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 videoEl.classList.add('active');
-                hideBridge();
                 video.active = true;
                 var p = videoMedia.play();
                 if (p && p.catch) p.catch(function(err) { broadcast('videoError', { phase: 'play', message: String(err) }); });
@@ -1388,8 +1359,7 @@
         // (true safe-to-close). Rich per-tick logging reports the real download
         // rate so we can tell if Cast's Chrome honours the seek-ahead or re-throttles.
         function startVideo(data) {
-            showBridge();            // freeze the outgoing frame so a video→video swap can't flash black
-            clearVideo('restart');   // stop any prior video (the bridge holds its last frame on top)
+            clearVideo('restart');   // stop any prior video; the poster-image bridge (if any) holds the screen until reveal
 
             video.url = data.url;
             video.fullyBuffered = false;
@@ -1416,28 +1386,39 @@
                 if (video.preloadTimer) { clearInterval(video.preloadTimer); video.preloadTimer = null; }
                 videoMedia.loop = loop;
                 try { videoMedia.currentTime = 0; } catch (e) {}
-                clearSlideshow('video');
-                clearMotion('video');
-                splash.style.display = 'none';
-                canvas.style.display = 'none';
-                videoEl.classList.add('active');
-                video.active = true;
+                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
+                attachVideoResilience();
+
+                // "Show new, then pull old": keep the current surface (the poster
+                // image bridge, or whatever's on screen) UP until the video is
+                // genuinely painting a decoded frame — the first timeupdate after
+                // seeking to 0 — then reveal the video and drop the old surface in
+                // the SAME turn. Revealing a not-yet-painted <video> shows its black
+                // background — exactly the flash we're killing — so we NEVER reveal
+                // on a timer. If the video never plays, the poster simply stays up
+                // (no black); the sender's in-flight guard + heartbeat cover that.
+                var swappedIn = false;
+                var swapIn = function () {
+                    if (swappedIn) return;
+                    swappedIn = true;
+                    videoMedia.removeEventListener('timeupdate', swapIn);
+                    clearSlideshow('video');
+                    clearMotion('video');
+                    videoEl.classList.add('active');   // new video paints its decoded frame…
+                    splash.style.display = 'none';
+                    canvas.style.display = 'none';     // …as the bridge image is removed — same turn
+                    video.active = true;
+                    broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
+                                                vh: videoMedia.videoHeight || 0, ts: Date.now() });
+                    tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
+                };
+                videoMedia.addEventListener('timeupdate', swapIn);
+
                 var p = videoMedia.play();
                 if (p && p.catch) p.catch(function(err) {
                     tlog('error', 'video play() rejected: ' + err);
                     broadcast('videoError', { phase: 'play', message: String(err), url: video.url });
                 });
-                if (!video.heartbeat) video.heartbeat = setInterval(videoHeartbeat, 5000);
-                attachVideoResilience();
-                // Release the freeze-frame only once the NEW video is actually
-                // painting (first timeupdate = playback has progressed), so the
-                // swap has zero black frames. Fallback timer never strands it.
-                var releaseBridge = function () { videoMedia.removeEventListener('timeupdate', releaseBridge); hideBridge(); };
-                videoMedia.addEventListener('timeupdate', releaseBridge);
-                setTimeout(hideBridge, 500);
-                broadcast('videoPlaying', { url: video.url, vw: videoMedia.videoWidth || 0,
-                                            vh: videoMedia.videoHeight || 0, ts: Date.now() });
-                tlog('info', 'video revealed (' + reason + ') at ' + bufferedInfo().pct + '% buffered');
             }
 
             function preloadTick() {
@@ -1520,46 +1501,12 @@
 
             if (data.action === 'show') {
                 // A single image (album art, movie poster, auto-push) permanently
-                // stops any running slideshow / motion poster and displays it.
-                //
-                // Switch surfaces ATOMICALLY once the new image has DECODED:
-                // whatever is currently on screen — a motion poster, the prior
-                // single image, or a slideshow — is held until then, and the
-                // teardown + reveal + double-buffer swap all happen in one
-                // synchronous turn inside onload. Revealing the canvas (or
-                // clearing motion) BEFORE the new image loaded used to briefly
-                // paint the stale previous frame. Image→image crossfade is
-                // unchanged (the inactive-mode teardowns are no-ops there); on a
-                // load failure the current surface simply stays up.
-                standbyImg.onload = function() {
-                    clearSlideshow('single-image');
-                    clearMotion('single-image');
-                    clearVideo('single-image');
-                    hideBridge();
-                    splash.style.display = 'none';
-                    canvas.style.display = 'block';
-                    activeImg.classList.remove('active');
-                    standbyImg.classList.add('active');
-                    var temp = activeImg;
-                    activeImg = standbyImg;
-                    standbyImg = temp;
-                    sendMessage(event.senderId, {
-                        event: 'imageDisplayed',
-                        url: data.url,
-                        ts: Date.now(),
-                        processingMs: Date.now() - receivedAt
-                    });
-                };
-                standbyImg.onerror = function() {
-                    sendMessage(event.senderId, {
-                        event: 'error',
-                        message: 'Failed to load image',
-                        url: data.url,
-                        ts: Date.now(),
-                        processingMs: Date.now() - receivedAt
-                    });
-                };
-                standbyImg.src = data.url;
+                // stops any running slideshow / motion / video and displays it via
+                // the gapless double-buffered <img> swap — the previous surface is
+                // held until the new image has DECODED, then torn down + revealed in
+                // one synchronous turn (see showPosterImage). On a load failure the
+                // current surface simply stays up.
+                showPosterImage(data.url, event.senderId, receivedAt, null);
             }
 
             else if (data.action === 'motionPoster') {
@@ -1578,7 +1525,17 @@
             else if (data.action === 'showVideo') {
                 // Real video on the hardware video plane (4K-capable, screensaver-
                 // suppressing). Supersedes any image / slideshow / motion poster.
-                startVideo(data);
+                //
+                // With an `imageUrl` (gated still→video) bridge the swap: show the
+                // poster FIRST via the gapless <img> path, then startVideo reveals
+                // the video on its first painted frame and drops the image — no
+                // black flash, single decoder. Without one (test/motion clips)
+                // start the video directly (may briefly show the splash).
+                if (data.imageUrl) {
+                    showPosterImage(data.imageUrl, null, receivedAt, function () { startVideo(data); });
+                } else {
+                    startVideo(data);
+                }
                 sendMessage(event.senderId, {
                     event: 'videoStarted',
                     url: data.url,
