@@ -121,7 +121,18 @@
         #video-el {
             position: absolute; top: 0; left: 0;
             width: 100%; height: 100%;
-            object-fit: contain; background: #000;
+            object-fit: contain;
+            /* Probe: pull the <video> off the hardware overlay plane into GPU
+               compositing so DOM z-index works and the poster cover can sit ABOVE
+               it, hiding the ~1-frame black the plane paints on display:block
+               reveal. `background: transparent` means a not-yet-painted frame
+               shows the layer behind instead of black. Trade-off to verify: a
+               GPU-composited video may no longer count as "hardware video
+               playback" for the TV's screensaver suppression. */
+            background: transparent;
+            transform: translateZ(0);
+            will-change: transform;
+            backface-visibility: hidden;
         }
 
         /* ── Poster cover (still→video bridge) ───────────────────────────
