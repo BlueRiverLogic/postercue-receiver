@@ -136,6 +136,15 @@
             position: absolute; top: 0; left: 0;
             width: 100vw; height: 100vh;
             display: none; z-index: 11; background: #000;
+            /* Compositing hints: promote the cover to its own GPU layer so its
+               z-index can stack ABOVE the hardware video plane. On Chromecast/
+               webOS the <video> decodes to a hardware overlay that ignores DOM
+               z-index unless the competing DOM layer is itself GPU-composited.
+               The translateZ(0) is (re)applied in showBridgeCover() too, because
+               styleRotation() overwrites `transform` for portrait. */
+            will-change: transform;
+            backface-visibility: hidden;
+            transform: translateZ(0);
         }
         #bridge.active { display: block; }
     </style>
@@ -1075,8 +1084,14 @@
         function showBridgeCover(url, onReady) {
             bridgeCoverImg.onload = function() {
                 styleRotation(bridgeCover, currentRotation);   // portrait upright, mirrors #canvas
+                // Re-apply GPU promotion: styleRotation just overwrote `transform`
+                // (to '' for landscape or 'rotate(..)' for portrait), which would
+                // drop the cover back onto the non-composited layer — below the
+                // hardware video plane. Keep translateZ(0) so it stacks above.
+                bridgeCover.style.transform = (bridgeCover.style.transform
+                    ? bridgeCover.style.transform + ' ' : '') + 'translateZ(0)';
                 bridgeCover.classList.add('active');
-                tlog('verbose', 'bridge cover up');
+                tlog('verbose', 'bridge cover up (transform=' + bridgeCover.style.transform + ')');
                 if (onReady) onReady();
             };
             bridgeCoverImg.onerror = function() {
