@@ -121,18 +121,7 @@
         #video-el {
             position: absolute; top: 0; left: 0;
             width: 100%; height: 100%;
-            object-fit: contain;
-            /* Probe: pull the <video> off the hardware overlay plane into GPU
-               compositing so DOM z-index works and the poster cover can sit ABOVE
-               it, hiding the ~1-frame black the plane paints on display:block
-               reveal. `background: transparent` means a not-yet-painted frame
-               shows the layer behind instead of black. Trade-off to verify: a
-               GPU-composited video may no longer count as "hardware video
-               playback" for the TV's screensaver suppression. */
-            background: transparent;
-            transform: translateZ(0);
-            will-change: transform;
-            backface-visibility: hidden;
+            object-fit: contain; background: #000;
         }
 
         /* ── Poster cover (still→video bridge) ───────────────────────────
@@ -1195,6 +1184,14 @@
             videoMedia.onprogress = null; videoMedia.onpause = null; videoMedia.onplay = null;
             videoMedia.onwaiting = null; videoMedia.onstalled = null; videoMedia.onended = null;
             video.fullyBuffered = false;
+            // HIDE THE PLANE FIRST. `load()` (below) clears the <video> to opaque
+            // black, and if the element is still on-screen that black paints for a
+            // frame or two before it's hidden — the "take-down" flash. Removing the
+            // `active` class first drops the video plane so whatever is behind (the
+            // poster image / cover) shows immediately; the black reset then happens
+            // on an already-hidden element. This is the fix for the teardown flash.
+            video.active = false;
+            videoEl.classList.remove('active');
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.removeAttribute('src');
             try { videoMedia.load(); } catch (e) {}   // frees the decoder + buffered data
@@ -1206,9 +1203,7 @@
             if (video.url && video.url.indexOf('blob:') === 0) {
                 try { URL.revokeObjectURL(video.url); } catch (e) {}
             }
-            video.active = false;
             video.url = null;
-            videoEl.classList.remove('active');
             tlog('info', 'video cleared (' + (reason || '') + ')');
         }
 
