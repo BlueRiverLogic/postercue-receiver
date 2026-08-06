@@ -197,11 +197,14 @@
         var NAMESPACE = 'urn:x-cast:com.postercue';
 
         // ── Build ID ─────────────────────────────────────────────────────
-        // Bumped on EVERY receiver deploy. Surfaced in the `info` message the
-        // sender requests on each connect (and logged at READY), so a test log
-        // unambiguously shows which receiver build is actually live — the only
-        // reliable way to tell a fresh deploy from a cached/stale index.html.
-        // Format: <ISO date>T<HH:MM>-<short-change-tag>.
+        // Identifies which receiver build is actually live. Surfaced in the
+        // `info` message the sender requests on each connect (and logged at
+        // READY), so a test log unambiguously distinguishes a fresh deploy from
+        // a cached/stale index.html served by the CDN or Cast device.
+        //
+        // DO NOT hand-edit this to deploy — run ./deploy.sh "<tag>" "<msg>",
+        // which auto-stamps it (UTC timestamp + tag) on every deploy so it can
+        // never go stale. Format: <ISO date>T<HH:MM>Z-<short-change-tag>.
         var RECEIVER_BUILD = '2026-08-06T10:30-buildstamp+fastreveal';
 
         var splash = document.getElementById('splash');
