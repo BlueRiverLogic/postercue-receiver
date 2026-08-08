@@ -57,51 +57,6 @@
             visibility: visible;
         }
 
-        /* ── Motion poster layers (Cast-side animation) ──────────────────
-           A looping "motion poster" rendered entirely on the receiver from a
-           recipe + two plain <img> layers + a self-drawn <canvas> particle
-           layer. Deliberately NO WebGL / no canvas reads of the poster pixels
-           (cross-origin/CORS loads don't work over the plain-HTTP ingest the
-           Cast runtime allows — see the slideshow note in the script). */
-        #motion {
-            position: absolute; top: 0; left: 0;
-            width: 100vw; height: 100vh;
-            display: none; overflow: hidden; background: #000;
-            z-index: 6;
-            /* Promote the whole rotated container to its own GPU layer. In
-               portrait (90° rotation) the container's transform is otherwise
-               re-rasterized with the whole animating subtree every frame,
-               which roughly halved fps vs landscape. As a promoted layer the
-               rotation is a one-time compositor transform. */
-            will-change: transform;
-            backface-visibility: hidden;
-        }
-        #motion.active { display: block; }
-        #mp-fill, #mp-bg, #mp-subject {
-            position: absolute; top: 0; left: 0;
-            width: 100%; height: 100%;
-            will-change: transform;   /* GPU-composite the camera/parallax transforms */
-        }
-        /* Blurred, zoomed copy behind a portrait poster on a landscape TV.
-           A <canvas> painted with a tiny (≈64px) cover-cropped copy of the bg,
-           then upscaled to fill: the upscale IS the blur, so we avoid a
-           full-screen per-frame CSS blur() (the expensive part). brightness
-           is cheap and kept. */
-        #mp-fill    { transform: scale(1.25); filter: brightness(0.55); image-rendering: auto; }
-        #mp-bg      { object-fit: contain; }
-        #mp-subject { object-fit: contain; }
-        #mp-particles { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
-        /* Additive diagonal light sweep. */
-        #mp-sweep   { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-                      mix-blend-mode: screen; pointer-events: none; opacity: 0; will-change: transform; }
-        /* Warmth/colour grade wash. */
-        #mp-grade   { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-                      pointer-events: none; opacity: 0; }
-        /* Vignette darkening at the edges. */
-        #mp-vignette{ position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-                      pointer-events: none; opacity: 0;
-                      background: radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.92) 130%); }
-
         /* ── Video surface (hardware video plane) ────────────────────────
            A real <video> element decoded by the device's dedicated video
            hardware — the ONLY path to true 4K on Cast (the <img>/<canvas>
@@ -167,19 +122,6 @@
         <img id="img2" class="layer">
     </div>
 
-    <!-- Motion poster layers (see #motion CSS + the Motion Poster engine).
-         Back-to-front: blurred fill, background poster, subject cutout,
-         particle canvas, light sweep, colour grade, vignette. -->
-    <div id="motion">
-        <canvas id="mp-fill"></canvas>
-        <img    id="mp-bg">
-        <img    id="mp-subject">
-        <canvas id="mp-particles"></canvas>
-        <div    id="mp-sweep"></div>
-        <div    id="mp-grade"></div>
-        <div    id="mp-vignette"></div>
-    </div>
-
     <!-- Video surface: real <video> on the hardware video plane (4K-capable,
          screensaver-suppressing). muted+playsinline+autoplay so it can start
          without a user gesture; loop for seamless keep-alive / motion loops. -->
@@ -205,7 +147,7 @@
         // DO NOT hand-edit this to deploy — run ./deploy.sh "<tag>" "<msg>",
         // which auto-stamps it (UTC timestamp + tag) on every deploy so it can
         // never go stale. Format: <ISO date>T<HH:MM>Z-<short-change-tag>.
-        var RECEIVER_BUILD = '2026-08-07T20:39Z-motion-particles';
+        var RECEIVER_BUILD = '2026-08-08T01:03Z-drop-motion-recipe';
 
         var splash = document.getElementById('splash');
         var canvas = document.getElementById('canvas');
@@ -365,7 +307,6 @@
             // idempotent no-ops when inactive. Without the clearMotion, stopping
             // a slideshow (or clearing) could leave a motion poster superimposed
             // over the placeholder.
-            clearMotion('splash');
             clearSlideshow('splash');
             clearVideo('splash');
             hideBridgeCover();
@@ -546,7 +487,6 @@
 
         function startSlideshow(data) {
             clearSlideshow('restart');               // tear down any prior show first
-            clearMotion('slideshow');                // and any running motion poster
             clearVideo('slideshow');                 // …and any playing video
             hideBridgeCover();
 
@@ -628,594 +568,6 @@
             else if (op === 'stop')   { clearSlideshow('stop-command'); showSplash(); broadcast('slideshowStopped', {}); }
         }
 
-        // ══ Motion Poster engine ═════════════════════════════════════════
-        //
-        // Renders a looping "motion poster" on the receiver from a compact
-        // recipe (see the iOS MotionRecipe contract) plus two plain <img>
-        // layers (background + lifted subject PNG) and a self-drawn <canvas>
-        // particle layer.
-        //
-        // Design constraints (why it looks the way it does):
-        //   • Plain <img> ingest ONLY. Poster images arrive over plain HTTP
-        //     from the phone; cross-origin/CORS/canvas-reads of them do not
-        //     work on the Cast runtime (same finding as the slideshow above).
-        //     So we never sample the poster's pixels — the canvas only draws
-        //     OUR OWN generated particle sprites, which never taint anything.
-        //   • Effects that would need to read poster pixels (heat shimmer,
-        //     energy-flow, depth displacement) are NOT rendered here. What we
-        //     do render: Ken-Burns camera, subject parallax, particles, colour
-        //     grade, vignette, and a diagonal light sweep.
-        //   • All motion is a pure function of a loop phase (0..1), so it loops
-        //     seamlessly regardless of frame rate.
-        //   • ES5 only (var/function, no template literals) for older sticks.
-
-        var motionEl    = document.getElementById('motion');
-        var mpFill      = document.getElementById('mp-fill');
-        var mpBg        = document.getElementById('mp-bg');
-        var mpSubject   = document.getElementById('mp-subject');
-        var mpParticles = document.getElementById('mp-particles');
-        var mpSweep     = document.getElementById('mp-sweep');
-        var mpGrade     = document.getElementById('mp-grade');
-        var mpVignette  = document.getElementById('mp-vignette');
-
-        var motion = {
-            active: false,
-            raf: 0,
-            startTs: 0,
-            lastTs: 0,
-            loopMs: 12000,
-            recipe: null,
-            particles: [],
-            pctx: null,          // 2D context of the particle canvas
-            sprite: null,        // pre-rendered soft dot (fast drawImage, no per-particle gradients)
-            spriteAdditive: false,
-            // debug / telemetry
-            frames: 0,
-            fpsWindowStart: 0,
-            fpsWindowFrames: 0,
-            fps: 0,
-            heartbeat: null,
-            bgLoaded: false,
-            subjectLoaded: false
-        };
-
-        function rand(a, b) { return a + Math.random() * (b - a); }
-
-        // Paint the blurred-fill layer: draw the bg cover-cropped into a tiny
-        // (64×36) canvas backing, which CSS then upscales to fill the screen.
-        // The heavy bilinear upscale reads as a soft blur for free — far
-        // cheaper than a full-screen per-frame CSS blur(40px). Drawing a
-        // cross-origin <img> taints the canvas, but we only ever DISPLAY it
-        // (never read pixels), which is allowed. Static: painted once per push.
-        function paintFill(img) {
-            var W = 64, H = 36;   // 16:9 backing; the container is 1920×1080 pre-rotation
-            var iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
-            if (!iw || !ih || !mpFill.getContext) return;
-            mpFill.width = W; mpFill.height = H;
-            var fctx = mpFill.getContext('2d');
-            var scale = Math.max(W / iw, H / ih);   // cover
-            var dw = iw * scale, dh = ih * scale;
-            fctx.clearRect(0, 0, W, H);
-            fctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
-        }
-
-        // Tear the motion poster down and free its layers. Safe to call anytime.
-        function clearMotion(reason) {
-            if (!motion.active && motion.raf === 0) return;
-            if (motion.raf)       { cancelAnimationFrame(motion.raf); motion.raf = 0; }
-            if (motion.heartbeat) { clearInterval(motion.heartbeat);  motion.heartbeat = null; }
-            motion.active = false;
-            motion.particles = [];
-            mpBg.onload = null; mpBg.onerror = null; mpBg.src = '';
-            mpSubject.onload = null; mpSubject.onerror = null; mpSubject.src = '';
-            if (mpFill.getContext) { mpFill.getContext('2d').clearRect(0, 0, mpFill.width, mpFill.height); }
-            motionEl.classList.remove('active');
-            tlog('info', 'motion cleared (' + (reason || '') + ')');
-        }
-
-        // Nominal on-screen particle count per type (scaled by density).
-        function particleBaseCount(type) {
-            if (type === 'embers')     return 90;
-            if (type === 'dust')       return 70;
-            if (type === 'snow')       return 120;
-            if (type === 'rain')       return 200;
-            if (type === 'sparkle')    return 110;
-            if (type === 'fireflies')  return 30;
-            if (type === 'hearts')     return 14;
-            if (type === 'petals')     return 34;
-            if (type === 'confetti')   return 80;
-            if (type === 'groundMist') return 16;
-            if (type === 'leaves')     return 26;
-            if (type === 'sandstorm')  return 60;
-            if (type === 'bubbles')    return 22;
-            if (type === 'starfield')  return 130;
-            return 0;
-        }
-
-        // Pre-render a soft radial dot once; drawImage'ing it per particle is far
-        // cheaper than building a gradient every frame (matters on weak sticks).
-        function makeSoftSprite(color) {
-            var s = 64;
-            var c = document.createElement('canvas'); c.width = s; c.height = s;
-            var g = c.getContext('2d');
-            var grad = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
-            grad.addColorStop(0, 'rgba(' + color + ',1)');
-            grad.addColorStop(1, 'rgba(' + color + ',0)');
-            g.fillStyle = grad;
-            g.fillRect(0, 0, s, s);
-            return c;
-        }
-
-        // Pre-render a SHAPED sprite (heart / petal / leaf / bubble / confetti /
-        // fog puff) once per push, mirroring the onboard Core Graphics textures.
-        // `color` is an "r,g,b" string. Drawn on a 64×64 canvas centred at 32.
-        function makeShapeSprite(kind, color) {
-            var s = 64, c = document.createElement('canvas'); c.width = s; c.height = s;
-            var g = c.getContext('2d');
-            if (kind === 'fog') {
-                // A few overlapping soft lobes → a wispy puff (mist / sandstorm).
-                for (var k = 0; k < 4; k++) {
-                    var cx = 32 + rand(-10, 10), cy = 32 + rand(-8, 8), rr = rand(16, 26);
-                    var gg = g.createRadialGradient(cx, cy, 0, cx, cy, rr);
-                    gg.addColorStop(0, 'rgba(' + color + ',0.9)');
-                    gg.addColorStop(1, 'rgba(' + color + ',0)');
-                    g.fillStyle = gg; g.beginPath(); g.arc(cx, cy, rr, 0, 6.2832); g.fill();
-                }
-            } else if (kind === 'heart') {
-                g.fillStyle = 'rgba(' + color + ',1)';
-                var hx = 32, hy = 28, hs = 17;
-                g.beginPath();
-                g.moveTo(hx, hy + hs * 0.95);
-                g.bezierCurveTo(hx - hs * 1.5, hy - hs * 0.6, hx - hs * 0.5, hy - hs * 1.3, hx, hy - hs * 0.3);
-                g.bezierCurveTo(hx + hs * 0.5, hy - hs * 1.3, hx + hs * 1.5, hy - hs * 0.6, hx, hy + hs * 0.95);
-                g.closePath(); g.fill();
-            } else if (kind === 'petal') {
-                // Teardrop / almond — pointed top, round belly (no notch).
-                g.fillStyle = 'rgba(' + color + ',1)';
-                g.beginPath();
-                g.moveTo(32, 10);
-                g.quadraticCurveTo(55, 32, 32, 55);
-                g.quadraticCurveTo(9, 32, 32, 10);
-                g.closePath(); g.fill();
-            } else if (kind === 'leaf') {
-                g.fillStyle = 'rgba(' + color + ',1)';
-                g.beginPath();
-                g.moveTo(32, 7);
-                g.quadraticCurveTo(57, 32, 32, 57);
-                g.quadraticCurveTo(7, 32, 32, 7);
-                g.closePath(); g.fill();
-                g.strokeStyle = 'rgba(90,50,20,0.45)'; g.lineWidth = 2;   // midrib
-                g.beginPath(); g.moveTo(32, 12); g.lineTo(32, 52); g.stroke();
-            } else if (kind === 'bubble') {
-                var bg = g.createRadialGradient(32, 32, 0, 32, 32, 24);
-                bg.addColorStop(0, 'rgba(' + color + ',0.04)');
-                bg.addColorStop(0.82, 'rgba(' + color + ',0.14)');
-                bg.addColorStop(1, 'rgba(' + color + ',0)');
-                g.fillStyle = bg; g.beginPath(); g.arc(32, 32, 24, 0, 6.2832); g.fill();
-                g.strokeStyle = 'rgba(' + color + ',0.85)'; g.lineWidth = 2.5;   // rim
-                g.beginPath(); g.arc(32, 32, 23, 0, 6.2832); g.stroke();
-                g.fillStyle = 'rgba(255,255,255,0.9)';                           // specular
-                g.beginPath(); g.arc(24, 23, 4, 0, 6.2832); g.fill();
-            } else if (kind === 'confetti') {
-                g.fillStyle = 'rgba(' + color + ',1)';
-                g.fillRect(20, 12, 24, 40);
-            }
-            return c;
-        }
-
-        // Build N colour variants of a shaped sprite (confetti / autumn leaves).
-        function makeShapeVariants(kind, colors) {
-            var a = [];
-            for (var i = 0; i < colors.length; i++) a.push(makeShapeSprite(kind, colors[i]));
-            return a;
-        }
-
-        // Fade in over the first ~18% of life, hold, fade out over the last ~28%.
-        function envInOut(t) {
-            if (t < 0.18) return t / 0.18;
-            if (t > 0.72) { var f = (1 - t) / 0.28; return f < 0 ? 0 : f; }
-            return 1;
-        }
-
-        // Choose an ember seed point. If the recipe has hot regions and placement
-        // isn't 'fullFrame', seed near a random hot region (the "fire"); else seed
-        // across the lower half (embers rise). hotRegions are y-DOWN normalized.
-        function emberSeed(pc, w, h) {
-            var regions = pc.hotRegions || [];
-            var useRegions = (pc.placement !== 'fullFrame') && regions.length > 0 &&
-                             (pc.hotStrength == null || pc.hotStrength >= 0.3);
-            if (useRegions) {
-                var r = regions[Math.floor(Math.random() * regions.length)];
-                return { x: r.x * w + rand(-0.12, 0.12) * w, y: r.y * h + rand(-0.06, 0.06) * h };
-            }
-            return { x: rand(0, w), y: rand(0.5, 1.0) * h };
-        }
-
-        // Create one particle. dt-based velocities are in px per millisecond.
-        function spawnParticle(type, pc, w, h, initial) {
-            var sizeMult  = (pc.size == null)  ? 1   : pc.size;
-            var speedMult = (pc.speed == null) ? 0.5 : pc.speed;
-            var p = { type: type, additive: false, streak: false, baseAlpha: 0.5 };
-
-            if (type === 'embers') {
-                var s = emberSeed(pc, w, h);
-                p.x = s.x; p.y = s.y;
-                p.vx = rand(-8, 8) / 1000;
-                p.vy = -(40 + 80 * speedMult) / 1000;         // upward
-                p.size = rand(2, 5) * sizeMult;
-                p.life = initial ? rand(0, 3000) : 0;
-                p.maxLife = rand(2500, 5000);
-                p.additive = true;
-            } else if (type === 'dust') {
-                p.x = rand(0, w); p.y = rand(0, h);
-                var a = rand(0, Math.PI * 2), sp = (6 + 14 * speedMult) / 1000;
-                p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
-                p.size = rand(18, 52) * sizeMult;
-                p.life = initial ? rand(0, 9000) : 0;
-                p.maxLife = rand(8000, 12000);
-                p.baseAlpha = 0.26;
-            } else if (type === 'snow') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(-0.1, 0) * h;
-                p.vx = rand(-10, 20) / 1000; p.vy = (30 + 50 * speedMult) / 1000;
-                p.size = rand(2, 5) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;                  // recycled by going off-screen
-                p.baseAlpha = 0.85;
-            } else if (type === 'rain') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(-0.1, 0) * h;
-                p.vx = 40 / 1000; p.vy = (700 + 500 * speedMult) / 1000;
-                p.size = rand(8, 16) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.35; p.streak = true;
-            } else if (type === 'sparkle') {
-                p.x = rand(0, w); p.y = rand(0, h);
-                p.vx = rand(-5, 5) / 1000; p.vy = rand(-5, 5) / 1000;
-                p.size = rand(1.5, 4) * sizeMult;
-                p.life = initial ? rand(0, 1600) : 0;
-                p.maxLife = rand(1200, 2000);
-                p.additive = true;
-            } else if (type === 'fireflies') {
-                p.x = rand(0, w); p.y = rand(0, h);
-                var fa = rand(0, 6.2832), fsp = (6 + 10 * speedMult) / 1000;   // slow wander
-                p.vx = Math.cos(fa) * fsp; p.vy = Math.sin(fa) * fsp;
-                p.size = rand(3, 7) * sizeMult;
-                p.life = initial ? rand(0, 3000) : 0; p.maxLife = rand(3000, 4600);
-                p.baseAlpha = 0.95; p.env = 'blink'; p.phase = rand(0, 6.2832);
-                p.blend = 'lighter'; p.spriteScale = 3; p.sprite = motion.sprite;
-            } else if (type === 'hearts') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(1.0, 1.1) * h;
-                p.vx = rand(-6, 6) / 1000; p.vy = -(12 + 22 * speedMult) / 1000;   // float up
-                p.size = rand(34, 74) * sizeMult;
-                p.life = initial ? rand(0, 3000) : 0; p.maxLife = rand(4000, 6000);
-                p.baseAlpha = 0.6; p.env = 'inout';
-                p.rot = rand(-0.3, 0.3); p.rotSpeed = rand(-0.0006, 0.0006);
-                p.spriteScale = 1; p.blend = 'source-over'; p.sprite = motion.sprite;
-            } else if (type === 'petals') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(-0.1, 0) * h;
-                p.vx = rand(-8, 20) / 1000; p.vy = (45 + 70 * speedMult) / 1000;   // drift down
-                p.size = rand(14, 34) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;                                       // recycled off-screen
-                p.baseAlpha = 0.75;
-                p.rot = rand(0, 6.2832); p.rotSpeed = rand(-0.0018, 0.0018);       // tumble
-                p.spriteScale = 1; p.blend = 'source-over'; p.sprite = motion.sprite;
-            } else if (type === 'confetti') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(-0.1, 0) * h;
-                p.vx = rand(-30, 30) / 1000; p.vy = (120 + 160 * speedMult) / 1000;
-                p.size = rand(8, 20) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.95;
-                p.rot = rand(0, 6.2832); p.rotSpeed = rand(-0.006, 0.006);          // fast tumble
-                p.spriteScale = 1; p.blend = 'source-over';
-                p.sprite = motion.spriteVariants[Math.floor(Math.random() * motion.spriteVariants.length)];
-            } else if (type === 'groundMist') {
-                p.x = rand(0, w); p.y = initial ? rand(0.6, 1.05) * h : rand(0.95, 1.1) * h;
-                p.vx = rand(-6, 6) / 1000; p.vy = -(8 + 16 * speedMult) / 1000;    // creep up
-                p.size = rand(70, 150) * sizeMult;
-                p.life = initial ? rand(0, 4000) : 0; p.maxLife = rand(5000, 8000);
-                p.baseAlpha = 0.5; p.env = 'inout';
-                p.spriteScale = 1; p.blend = 'source-over'; p.sprite = motion.sprite;
-            } else if (type === 'leaves') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(-0.1, 0) * h;
-                p.vx = rand(-6, 30) / 1000; p.vy = (55 + 80 * speedMult) / 1000;   // wind-blown fall
-                p.size = rand(16, 40) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.9;
-                p.rot = rand(0, 6.2832); p.rotSpeed = rand(-0.003, 0.003);
-                p.spriteScale = 1; p.blend = 'source-over';
-                p.sprite = motion.spriteVariants[Math.floor(Math.random() * motion.spriteVariants.length)];
-            } else if (type === 'sandstorm') {
-                p.x = initial ? rand(0, w) : rand(-0.15, 0) * w;                   // blows in from left
-                p.y = rand(0, h);
-                p.vx = (240 + 300 * speedMult) / 1000; p.vy = rand(-8, 4) / 1000;
-                p.size = rand(50, 120) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.20;                                                // thin haze wall
-                p.spriteScale = 1; p.blend = 'source-over'; p.sprite = motion.sprite;
-            } else if (type === 'bubbles') {
-                p.x = rand(0, w); p.y = initial ? rand(0, h) : rand(1.0, 1.1) * h;
-                p.vx = rand(-6, 6) / 1000; p.vy = -(30 + 60 * speedMult) / 1000;   // rise
-                p.size = rand(20, 60) * sizeMult;
-                p.life = 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.6;
-                p.spriteScale = 1; p.blend = 'screen'; p.sprite = motion.sprite;
-            } else if (type === 'starfield') {
-                p.x = rand(0, w); p.y = rand(0, h);
-                p.vx = rand(-3, 3) / 1000; p.vy = (6 + 14 * speedMult) / 1000;     // slow drift
-                p.size = rand(2, 5) * sizeMult;
-                p.life = initial ? rand(0, 4000) : 0; p.maxLife = 9e9;
-                p.baseAlpha = 0.9; p.env = 'twinkle'; p.phase = rand(0, 6.2832);
-                p.blend = 'lighter'; p.spriteScale = 3; p.sprite = motion.sprite;
-            }
-            return p;
-        }
-
-        // Size the particle canvas to the viewport and seed the field.
-        // DPR is pinned to 1 (1920x1080) to keep cheap sticks smooth.
-        function setupParticles(pc) {
-            var w = Math.round(window.innerWidth);
-            var h = Math.round(window.innerHeight);
-            mpParticles.width = w;
-            mpParticles.height = h;
-            motion.pctx = mpParticles.getContext('2d');
-            motion.particles = [];
-
-            var type = pc.type || 'none';
-            motion.spriteVariants = null;
-            if (type === 'none') { motion.sprite = null; tlog('info', 'motion particles: none'); return; }
-
-            motion.rainColor = '180,205,255';
-            if (type === 'embers' || type === 'dust' || type === 'snow' ||
-                type === 'rain'   || type === 'sparkle') {
-                // Original five: one coloured soft sprite (rain uses line streaks).
-                var color = (type === 'embers')  ? '255,150,60'
-                          : (type === 'sparkle') ? '255,240,180'
-                          : (type === 'dust')    ? '235,235,240'
-                          :                        '255,255,255';   // snow
-                motion.sprite = makeSoftSprite(color);
-                motion.spriteAdditive = (type === 'embers' || type === 'sparkle');
-            } else {
-                // New effect family — soft or shaped sprites; per-particle blend is
-                // set in spawnParticle, so the field-wide additive flag is off.
-                motion.spriteAdditive = false;
-                if (type === 'fireflies')       motion.sprite = makeSoftSprite('255,217,102');
-                else if (type === 'starfield')  motion.sprite = makeSoftSprite('230,242,255');
-                else if (type === 'groundMist') motion.sprite = makeShapeSprite('fog', '217,217,217');
-                else if (type === 'sandstorm')  motion.sprite = makeShapeSprite('fog', '209,174,112');
-                else if (type === 'hearts')     motion.sprite = makeShapeSprite('heart', '255,89,128');
-                else if (type === 'petals')     motion.sprite = makeShapeSprite('petal', '255,199,217');
-                else if (type === 'bubbles')    motion.sprite = makeShapeSprite('bubble', '217,242,255');
-                else if (type === 'confetti')   motion.spriteVariants =
-                    makeShapeVariants('confetti', ['239,71,111', '255,209,102', '6,214,160', '17,138,178', '255,150,60']);
-                else if (type === 'leaves')     motion.spriteVariants =
-                    makeShapeVariants('leaf', ['196,86,28', '214,140,40', '170,60,30', '176,120,32']);
-                else                            motion.sprite = makeSoftSprite('255,255,255');
-            }
-
-            var density = (pc.density == null) ? 0.5 : pc.density;
-            var count = Math.round(particleBaseCount(type) * density);
-            tlog('info', 'motion particles: ' + type + ' x' + count + ' (density ' + density + ', size ' + (pc.size || 1) + ')');
-            for (var i = 0; i < count; i++) motion.particles.push(spawnParticle(type, pc, w, h, true));
-        }
-
-        function updateAndDrawParticles(dt) {
-            var ctx = motion.pctx;
-            if (!ctx) return;
-            var w = mpParticles.width, h = mpParticles.height;
-            ctx.clearRect(0, 0, w, h);
-            var ps = motion.particles;
-            if (ps.length === 0) return;
-            var pc = motion.recipe.particle || {};
-
-            for (var i = 0; i < ps.length; i++) {
-                var p = ps[i];
-                p.x += p.vx * dt; p.y += p.vy * dt; p.life += dt;
-                if (p.rot != null) p.rot += (p.rotSpeed || 0) * dt;   // tumble (shaped types)
-
-                // Recycle when off-screen or past end-of-life. Margin scales with
-                // size so large shapes (hearts/mist) aren't clipped while visible.
-                var m = 60 + (p.size || 0);
-                if (p.life >= p.maxLife || p.y < -m || p.y > h + m || p.x < -m || p.x > w + m) {
-                    ps[i] = spawnParticle(p.type, pc, w, h, false);
-                    p = ps[i];
-                }
-
-                // Alpha envelope.
-                var alpha;
-                if (p.env === 'inout')         { alpha = envInOut(p.life / p.maxLife) * p.baseAlpha; }
-                else if (p.env === 'blink')    { alpha = envInOut(p.life / p.maxLife) *
-                                                         (0.30 + 0.70 * Math.abs(Math.sin(p.life * 0.006 + p.phase))) * p.baseAlpha; }
-                else if (p.env === 'twinkle')  { alpha = (0.55 + 0.45 * Math.sin(p.life * 0.005 + p.phase)) * p.baseAlpha; }
-                else if (p.type === 'embers')  { alpha = (1 - p.life / p.maxLife) * 0.9; }
-                else if (p.type === 'sparkle') { alpha = Math.sin((p.life / p.maxLife) * Math.PI); }
-                else                           { alpha = p.baseAlpha; }
-                if (alpha <= 0.01) continue;
-
-                if (p.streak) {
-                    // Rain: a short line along the velocity vector.
-                    ctx.globalCompositeOperation = 'source-over';
-                    ctx.strokeStyle = 'rgba(' + motion.rainColor + ',' + alpha.toFixed(3) + ')';
-                    ctx.lineWidth = Math.max(1, p.size * 0.14);
-                    ctx.beginPath();
-                    ctx.moveTo(p.x, p.y);
-                    ctx.lineTo(p.x - p.vx * 45, p.y - p.vy * 45);
-                    ctx.stroke();
-                } else {
-                    var sprite = p.sprite || motion.sprite;
-                    ctx.globalCompositeOperation = p.blend || (motion.spriteAdditive ? 'lighter' : 'source-over');
-                    ctx.globalAlpha = alpha;
-                    var d = p.size * (p.spriteScale || 3);   // soft dots draw larger; shapes at nominal
-                    if (p.rot != null) {
-                        ctx.save();
-                        ctx.translate(p.x, p.y); ctx.rotate(p.rot);
-                        ctx.drawImage(sprite, -d / 2, -d / 2, d, d);
-                        ctx.restore();
-                    } else {
-                        ctx.drawImage(sprite, p.x - d / 2, p.y - d / 2, d, d);
-                    }
-                }
-            }
-            ctx.globalAlpha = 1;
-            ctx.globalCompositeOperation = 'source-over';
-        }
-
-        // The per-frame animation tick. Everything is derived from `phase`
-        // (0..1 over loopMs) so the loop is seamless.
-        function motionTick(ts) {
-            if (!motion.active) return;
-            if (motion.startTs === 0) { motion.startTs = ts; motion.lastTs = ts; motion.fpsWindowStart = ts; }
-            var dt = Math.min(64, ts - motion.lastTs);      // clamp long gaps (throttling)
-            motion.lastTs = ts;
-
-            var r = motion.recipe;
-            var phase = ((ts - motion.startTs) % motion.loopMs) / motion.loopMs;
-            var theta = phase * 6.2831853;
-            var sinT = Math.sin(theta);
-
-            var cam = r.camera || {}, par = r.parallax || {};
-            var zoomOsc = (cam.zoom || 0) * (1 - Math.cos(theta)) / 2;   // 0 → peak → 0 (loops)
-            var panX = (cam.driftX || 0) * sinT * 100;                  // % of viewport
-            var panY = (cam.driftY || 0) * sinT * 100;
-
-            // Background Ken-Burns.
-            mpBg.style.transform =
-                'translate(' + panX.toFixed(3) + '%,' + panY.toFixed(3) + '%) scale(' + (1 + zoomOsc).toFixed(4) + ')';
-
-            // Subject parallax: moves further than the background + gentle breathing.
-            if (motion.subjectLoaded) {
-                var f = 1 + (par.strength || 0);
-                var breathe = 1 + (par.breathing || 0) * sinT;
-                mpSubject.style.transform =
-                    'translate(' + (panX * f).toFixed(3) + '%,' + (panY * f).toFixed(3) + '%) scale(' +
-                    ((1 + zoomOsc) * breathe).toFixed(4) + ')';
-            }
-
-            // Light sweep: slide the diagonal band from off-screen to off-screen.
-            if ((r.sweep || 0) > 0.01) {
-                var pos = -120 + 340 * phase;
-                mpSweep.style.transform = 'translateX(' + pos.toFixed(1) + '%)';
-            }
-
-            updateAndDrawParticles(dt);
-
-            // FPS telemetry (1s window).
-            motion.frames++; motion.fpsWindowFrames++;
-            if (ts - motion.fpsWindowStart >= 1000) {
-                motion.fps = Math.round(motion.fpsWindowFrames * 1000 / (ts - motion.fpsWindowStart));
-                motion.fpsWindowStart = ts; motion.fpsWindowFrames = 0;
-            }
-
-            motion.raf = requestAnimationFrame(motionTick);
-        }
-
-        function motionHeartbeat() {
-            if (!motion.active) return;
-            broadcast('motionHeartbeat', {
-                fps: motion.fps,
-                particles: motion.particles.length,
-                bgLoaded: motion.bgLoaded,
-                subjectLoaded: motion.subjectLoaded,
-                rot: currentRotation,                                   // isolate rotation vs fps
-                fill: (motion.recipe && motion.recipe.fill) || '',
-                bgW: mpBg.naturalWidth || 0, bgH: mpBg.naturalHeight || 0,   // decoded bg resolution
-                heap: heapStats()
-            });
-        }
-
-        // Build & start a motion poster from a recipe.
-        function startMotion(recipe) {
-            // Stop any PRIOR motion immediately (safe — its raf is cancelled
-            // before we mutate the shared `motion` state below). But do NOT tear
-            // down the current single-image / slideshow surface or reveal #motion
-            // yet: hold whatever's on screen until the poster background has
-            // DECODED, then go live + hide the others inside mpBg.onload. Doing it
-            // eagerly here used to flash the motion container's black background
-            // before the poster finished loading.
-            clearMotion('restart');
-
-            motion.recipe = recipe;
-            motion.loopMs = Math.max(2000, (recipe.loopSeconds || 12) * 1000);
-            motion.bgLoaded = false;
-            motion.subjectLoaded = false;
-
-            tlog('info', 'motion start: type=' + (recipe.particle && recipe.particle.type) +
-                         ' fill=' + recipe.fill + ' loop=' + motion.loopMs + 'ms');
-
-            // Whole container rotates like the other layers (portrait displays).
-            styleRotation(motionEl, currentRotation);
-
-            // Fill mode: portrait poster → soft fill behind + contain; else cover.
-            // The fill canvas is painted in mpBg.onload (below) once the bg
-            // image has decoded — see paintFill().
-            if (recipe.fill === 'cover') {
-                mpBg.style.objectFit = 'cover';
-                mpFill.style.display = 'none';
-            } else {
-                mpBg.style.objectFit = 'contain';
-                mpFill.style.display = 'block';
-            }
-
-            // Colour grade wash (warm amber / cool blue via soft-light).
-            var warmth = (recipe.grade && recipe.grade.warmth) || 0;
-            if (Math.abs(warmth) > 0.01) {
-                mpGrade.style.background = 'rgba(' + (warmth > 0 ? '255,150,60' : '60,130,255') + ',1)';
-                mpGrade.style.mixBlendMode = 'soft-light';
-                mpGrade.style.opacity = Math.min(0.6, Math.abs(warmth) * 0.5);
-            } else {
-                mpGrade.style.opacity = 0;
-            }
-
-            // Vignette.
-            mpVignette.style.opacity = (recipe.grade && recipe.grade.vignette) || 0;
-
-            // Light-sweep band amount (moved each frame in motionTick).
-            var sweepAmt = recipe.sweep || 0;
-            if (sweepAmt > 0.01) {
-                mpSweep.style.background =
-                    'linear-gradient(115deg, rgba(255,250,235,0) 42%, rgba(255,250,235,' +
-                    (0.5 * sweepAmt).toFixed(3) + ') 50%, rgba(255,250,235,0) 58%)';
-                mpSweep.style.opacity = 1;
-            } else {
-                mpSweep.style.opacity = 0;
-            }
-
-            // Load images (plain <img>, no crossOrigin — the proven ingest).
-            mpBg.onload  = function() {
-                motion.bgLoaded = true;
-                tlog('verbose', 'motion bg loaded ' + mpBg.naturalWidth + 'x' + mpBg.naturalHeight);
-                if (recipe.fill !== 'cover') { paintFill(mpBg); }
-                // Poster decoded — NOW reveal motion and tear down the other
-                // surfaces (held until this moment so the prior image/slideshow
-                // stayed visible instead of a black flash).
-                clearSlideshow('motion');            // motion supersedes any slideshow
-                clearVideo('motion');                // …and any playing video
-                hideBridgeCover();
-                splash.style.display = 'none';
-                canvas.style.display = 'none';
-                motionEl.classList.add('active');
-                motion.active = true;
-                motion.startTs = 0; motion.lastTs = 0;
-                motion.frames = 0; motion.fpsWindowFrames = 0;
-                if (!motion.raf)       motion.raf = requestAnimationFrame(motionTick);
-                if (!motion.heartbeat) motion.heartbeat = setInterval(motionHeartbeat, 5000);
-            };
-            mpBg.onerror = function() { tlog('error', 'motion bg FAILED ' + recipe.bg); broadcast('motionError', { phase: 'bg', url: recipe.bg }); };
-            mpBg.src = recipe.bg;
-
-            if (recipe.subject) {
-                mpSubject.style.display = 'block';
-                mpSubject.onload  = function() { motion.subjectLoaded = true; tlog('verbose', 'motion subject loaded'); };
-                mpSubject.onerror = function() { tlog('error', 'motion subject FAILED ' + recipe.subject); broadcast('motionError', { phase: 'subject', url: recipe.subject }); };
-                mpSubject.src = recipe.subject;
-            } else {
-                mpSubject.style.display = 'none';
-                mpSubject.src = '';
-            }
-
-            setupParticles(recipe.particle || {});
-
-            // NB: motion goes live in mpBg.onload above — once the poster has
-            // decoded — not here, so the previous surface holds until it's ready.
-        }
-
         // ══ Video engine ═══════════════════════════════════════════════
         //
         // Plays a real H.264/HEVC <video> served over plain HTTP from the
@@ -1252,7 +604,6 @@
         function showPosterImage(url, senderId, receivedAt, onShown) {
             standbyImg.onload = function() {
                 clearSlideshow('single-image');
-                clearMotion('single-image');
                 clearVideo('single-image');
                 hideBridgeCover();
                 splash.style.display = 'none';
@@ -1616,7 +967,6 @@
             styleRotation(videoEl, 0);
             videoMedia.oncanplay = function() {
                 clearSlideshow('blob-video');
-                clearMotion('blob-video');
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
                 videoEl.classList.add('active');
@@ -1690,7 +1040,6 @@
                 // video never paints (wedge), the cover stays up: poster held, never
                 // black. Without a cover (test/motion clips) reveal directly.
                 clearSlideshow('video');
-                clearMotion('video');
                 videoEl.classList.add('active');
                 splash.style.display = 'none';
                 canvas.style.display = 'none';
@@ -1823,18 +1172,6 @@
                 showPosterImage(data.url, event.senderId, receivedAt, null);
             }
 
-            else if (data.action === 'motionPoster') {
-                // Cast-side animated poster. See the Motion Poster engine above.
-                startMotion(data);
-                sendMessage(event.senderId, {
-                    event: 'motionPosterStarted',
-                    type: (data.particle && data.particle.type) || 'none',
-                    fill: data.fill,
-                    loopMs: motion.loopMs,
-                    ts: Date.now(),
-                    processingMs: Date.now() - receivedAt
-                });
-            }
 
             else if (data.action === 'showVideo') {
                 // Real video on the hardware video plane (4K-capable, screensaver-
@@ -1866,10 +1203,6 @@
 
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
-                // Keep a live motion poster upright too if orientation changes.
-                // (Video is never rotated here — its pixels are pre-rotated by
-                // the sender to keep the encoded frame landscape/decoder-safe.)
-                if (motion.active) styleRotation(motionEl, data.rotation || 0);
                 // Remember it for this device so the next cold start paints the
                 // placeholder in the right orientation immediately (no flash).
                 try { localStorage.setItem('pc_rotation', String(currentRotation)); } catch (e) {}
@@ -1885,7 +1218,6 @@
                 stopBlobBeat();       // abort any in-flight transfer's liveness ticker
                 blobXfer = null;      // and drop its partial buffer
                 clearSlideshow('clear-command');
-                clearMotion('clear-command');
                 clearVideo('clear-command');
                 // Detach load/error handlers BEFORE clearing src —
                 // setting src='' triggers onerror, which would fire
