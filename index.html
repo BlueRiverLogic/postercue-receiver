@@ -147,7 +147,7 @@
         // DO NOT hand-edit this to deploy — run ./deploy.sh "<tag>" "<msg>",
         // which auto-stamps it (UTC timestamp + tag) on every deploy so it can
         // never go stale. Format: <ISO date>T<HH:MM>Z-<short-change-tag>.
-        var RECEIVER_BUILD = '2026-08-08T01:03Z-drop-motion-recipe';
+        var RECEIVER_BUILD = '2026-08-10T16:21Z-update';
 
         var splash = document.getElementById('splash');
         var canvas = document.getElementById('canvas');
@@ -1344,6 +1344,37 @@
                 } catch(e) {
                     screenInfo.error = e.message;
                 }
+                // [StaleDiag] Snapshot of what this receiver is CURRENTLY showing.
+                // The receiver is long-lived (disableIdleTimeout + maxInactivity ~24h)
+                // and deliberately keeps its last <video> resident so a Cue-the-Show
+                // survives the phone app closing. Because of that, a freshly-connected
+                // phone can find the receiver ALREADY displaying content from a previous
+                // session. Reporting the live surface here lets the app log prove (or
+                // rule out) that a "stale motion poster" seen when switching the TV's
+                // HDMI input back to the Cast device was leftover content this session
+                // never pushed. Wrapped in try/catch so a missing element can never
+                // break the getInfo response.
+                var surfaceState = {};
+                try {
+                    surfaceState = {
+                        video: {
+                            active: video.active,
+                            url: video.url || '',
+                            src: videoMedia.currentSrc || videoMedia.getAttribute('src') || '',
+                            playing: !videoMedia.paused && !videoMedia.ended && (videoMedia.currentTime || 0) > 0,
+                            paused: videoMedia.paused,
+                            currentTime: +((videoMedia.currentTime || 0).toFixed(2))
+                        },
+                        imageActive: activeImg.classList.contains('active'),
+                        imageSrc: activeImg.src || '',
+                        slideshowActive: slideshow.active,
+                        slideshowCount: slideshow.images.length,
+                        splashVisible: splash.style.display !== 'none',
+                        rotation: currentRotation
+                    };
+                } catch (e) {
+                    surfaceState.error = e.message;
+                }
                 sendMessage(event.senderId, {
                     event: 'info',
                     build: RECEIVER_BUILD,
@@ -1352,6 +1383,7 @@
                     rotation: currentRotation,
                     devicePixelRatio: dpr,
                     screen: screenInfo,
+                    surface: surfaceState,
                     ts: Date.now(),
                     processingMs: Date.now() - receivedAt
                 });
