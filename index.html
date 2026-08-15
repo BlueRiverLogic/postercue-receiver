@@ -147,7 +147,7 @@
         // DO NOT hand-edit this to deploy — run ./deploy.sh "<tag>" "<msg>",
         // which auto-stamps it (UTC timestamp + tag) on every deploy so it can
         // never go stale. Format: <ISO date>T<HH:MM>Z-<short-change-tag>.
-        var RECEIVER_BUILD = '2026-08-10T16:21Z-update';
+        var RECEIVER_BUILD = '2026-08-15T15:55Z-rtc-live';
 
         var splash = document.getElementById('splash');
         var canvas = document.getElementById('canvas');
@@ -742,6 +742,10 @@
             videoEl.classList.remove('active');
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.removeAttribute('src');
+            // Release any live WebRTC stream + peer connection so switching to a
+            // normal video/image never leaves a camera feed attached behind it.
+            videoMedia.srcObject = null;
+            if (typeof rtc !== 'undefined' && rtc.pc) { try { rtc.pc.close(); } catch (e) {} rtc.pc = null; }
             try { videoMedia.load(); } catch (e) {}   // frees the decoder + buffered data
             // Release the in-RAM Blob. An object URL holds a STRONG reference to its
             // Blob, so without revoke the (up to ~45 MB) slideshow video stays resident
@@ -1154,6 +1158,92 @@
                          ' timeout=' + (PRELOAD_TIMEOUT_MS / 1000) + 's');
         }
 
+        // ── WebRTC live camera (Window Frame live → Cast) ────────────────
+        // Same-LAN RTCPeerConnection. The phone sends ONE fully-gathered SDP
+        // offer (Cast has no Trickle ICE); we answer with our fully-gathered
+        // SDP, and attach the incoming track to the same <video> surface.
+        // Empty iceServers → host candidates only (no STUN/TURN on the LAN).
+        var rtc = { pc: null, senderId: null };
+
+        function rtcReport(senderId, evt, extra) {
+            if (!senderId) return;
+            var payload = { event: evt, ts: Date.now() };
+            if (extra) for (var k in extra) payload[k] = extra[k];
+            sendMessage(senderId, payload);
+        }
+
+        function handleRtcStop(senderId) {
+            if (rtc.pc) { try { rtc.pc.close(); } catch (e) {} rtc.pc = null; }
+            try { videoMedia.pause(); } catch (e) {}
+            videoMedia.srcObject = null;
+            video.active = false;
+            videoEl.classList.remove('active');
+            showSplash();
+            tlog('info', 'RTC stopped');
+            rtcReport(senderId, 'rtcState', { state: 'closed' });
+        }
+
+        function handleRtcOffer(data, senderId) {
+            tlog('info', 'RTC offer received (' + (data.sdp ? data.sdp.length : 0) + ' B)');
+            clearVideo('rtc');                                  // tear down any prior surface
+            if (rtc.pc) { try { rtc.pc.close(); } catch (e) {} rtc.pc = null; }
+            rtc.senderId = senderId;
+
+            var pc;
+            try { pc = new RTCPeerConnection({ iceServers: [] }); }
+            catch (e) { rtcReport(senderId, 'rtcError', { message: 'RTCPeerConnection unavailable: ' + e }); return; }
+            rtc.pc = pc;
+
+            pc.oniceconnectionstatechange = function () {
+                tlog('info', 'RTC ice=' + pc.iceConnectionState);
+                rtcReport(senderId, 'rtcState', { state: pc.iceConnectionState });
+            };
+            pc.ontrack = function (e) {
+                var stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+                videoMedia.srcObject = stream;
+                videoMedia.muted = true;
+                videoMedia.loop = false;
+                videoMedia.style.objectFit = (data.fill === 'contain') ? 'contain' : 'cover';
+                styleRotation(videoEl, 0);                      // spike: plain landscape camera
+                clearSlideshow('rtc');
+                videoEl.classList.add('active');
+                splash.style.display = 'none';
+                canvas.style.display = 'none';
+                video.active = true;
+                videoMedia.onplaying = function () {
+                    rtcReport(senderId, 'rtcState', { state: 'playing',
+                              vw: videoMedia.videoWidth || 0, vh: videoMedia.videoHeight || 0 });
+                    tlog('info', 'RTC playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0));
+                };
+                var p = videoMedia.play();
+                if (p && p.catch) p.catch(function (err) {
+                    rtcReport(senderId, 'rtcError', { message: 'play() rejected: ' + err });
+                });
+            };
+
+            pc.setRemoteDescription({ type: 'offer', sdp: data.sdp })
+              .then(function () { return pc.createAnswer(); })
+              .then(function (answer) { return pc.setLocalDescription(answer); })
+              .then(function () {
+                  var done = false;
+                  function sendAnswer() {
+                      if (done) return; done = true;
+                      rtcReport(senderId, 'rtcAnswer', { sdp: pc.localDescription.sdp });
+                      tlog('info', 'RTC answer sent');
+                  }
+                  // Non-trickle: wait for gathering to complete so the answer SDP
+                  // carries all host candidates, then send once (with a fallback).
+                  if (pc.iceGatheringState === 'complete') { sendAnswer(); return; }
+                  pc.onicegatheringstatechange = function () {
+                      if (pc.iceGatheringState === 'complete') sendAnswer();
+                  };
+                  setTimeout(sendAnswer, 1500);
+              })
+              .catch(function (err) {
+                  rtcReport(senderId, 'rtcError', { message: 'negotiation failed: ' + err });
+              });
+        }
+
         context.addCustomMessageListener(NAMESPACE, function(event) {
             var receivedAt = Date.now();
             inboundMsgCount++;   // every inbound custom message — the blob beat delta's this to expose delivery rate
@@ -1200,6 +1290,9 @@
             else if (data.action === 'videoBlobBegin') { handleVideoBlobBegin(data); }
             else if (data.action === 'videoBlobChunk') { handleVideoBlobChunk(data); }
             else if (data.action === 'videoBlobEnd')   { handleVideoBlobEnd(data); }
+
+            else if (data.action === 'rtcOffer') { handleRtcOffer(data, event.senderId); }
+            else if (data.action === 'rtcStop')  { handleRtcStop(event.senderId); }
 
             else if (data.action === 'setOrientation') {
                 applyRotation(data.rotation || 0);
