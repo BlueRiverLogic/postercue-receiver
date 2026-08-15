@@ -147,7 +147,7 @@
         // DO NOT hand-edit this to deploy — run ./deploy.sh "<tag>" "<msg>",
         // which auto-stamps it (UTC timestamp + tag) on every deploy so it can
         // never go stale. Format: <ISO date>T<HH:MM>Z-<short-change-tag>.
-        var RECEIVER_BUILD = '2026-08-15T15:55Z-rtc-live';
+        var RECEIVER_BUILD = '2026-08-15T17:12Z-rtc-rotation';
 
         var splash = document.getElementById('splash');
         var canvas = document.getElementById('canvas');
@@ -1176,6 +1176,7 @@
             if (rtc.pc) { try { rtc.pc.close(); } catch (e) {} rtc.pc = null; }
             try { videoMedia.pause(); } catch (e) {}
             videoMedia.srcObject = null;
+            styleRotation(videoEl, 0);          // reset — never leave a live rotation behind
             video.active = false;
             videoEl.classList.remove('active');
             showSplash();
@@ -1204,7 +1205,12 @@
                 videoMedia.muted = true;
                 videoMedia.loop = false;
                 videoMedia.style.objectFit = (data.fill === 'contain') ? 'contain' : 'cover';
-                styleRotation(videoEl, 0);                      // spike: plain landscape camera
+                // Rotate the LIVE video by the TV's mount angle so the phone-upright
+                // stream lands upright on any of the 4 mounts. Uses the same rotate-
+                // and-fill helper as images. This is the ONLY non-zero rotation of
+                // videoEl — the baked-video path always resets it to 0 in startVideo,
+                // and handleRtcStop resets it too, so no other surface is affected.
+                styleRotation(videoEl, data.rotation || 0);
                 clearSlideshow('rtc');
                 videoEl.classList.add('active');
                 splash.style.display = 'none';
@@ -1212,8 +1218,10 @@
                 video.active = true;
                 videoMedia.onplaying = function () {
                     rtcReport(senderId, 'rtcState', { state: 'playing',
-                              vw: videoMedia.videoWidth || 0, vh: videoMedia.videoHeight || 0 });
-                    tlog('info', 'RTC playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0));
+                              vw: videoMedia.videoWidth || 0, vh: videoMedia.videoHeight || 0,
+                              rot: data.rotation || 0 });
+                    tlog('info', 'RTC playing ' + (videoMedia.videoWidth || 0) + 'x' + (videoMedia.videoHeight || 0)
+                                 + ' mount=' + (data.rotation || 0) + '°');
                 };
                 var p = videoMedia.play();
                 if (p && p.catch) p.catch(function (err) {
